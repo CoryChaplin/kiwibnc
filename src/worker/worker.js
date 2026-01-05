@@ -55,6 +55,7 @@ async function run() {
     initStatus(app);
     await initExtensions(app);
     broadcastStats(app);
+    monitorEventLoop(app);
     await startServers(app);
     await loadConnections(app);
 
@@ -107,6 +108,21 @@ function broadcastStats(app) {
     }
 
     broadcast();
+}
+
+function monitorEventLoop(app) {
+    let lastCheck = Date.now();
+    const interval = 1000;
+
+    setInterval(() => {
+        const now = Date.now();
+        const lag = now - lastCheck - interval;
+        lastCheck = now;
+
+        // Record lag in milliseconds
+        // A lag > 20-50ms indicates CPU saturation
+        app.stats.gauge('worker.eventloop_lag', Math.max(0, lag));
+    }, interval);
 }
 
 async function prepareShutdown(app) {
@@ -197,9 +213,11 @@ function listenToQueue(app) {
         }
     });
     app.queue.on('connection.data', async (event) => {
+        let timer = app.stats.timerStart('worker.process_message_time');
         let con = cons.get(event.id);
         if (!con) {
             l.warn('Recieved data for unknown connection ' + event.id);
+            timer.stop();
             return;
         }
 
@@ -210,6 +228,7 @@ function listenToQueue(app) {
                 snippet += '...';
             }
             l.warn('Recieved malformed IRC line from connection ' + event.id + ' - ' + snippet);
+            timer.stop();
             return;
         }
 
@@ -218,6 +237,7 @@ function listenToQueue(app) {
         } else {
             await con.messageFromUpstream(msg, event.data);
         }
+        timer.stop();
     });
 }
 
