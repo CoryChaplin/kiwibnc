@@ -15,6 +15,9 @@ class SqliteMessageStore {
 
         let loggingConf = config.get('logging', {});
         this.db = new sqlite3(config.relativePath(loggingConf.database));
+        this.retentionDaysChannels = loggingConf.retention_days_channels || 0;
+        this.retentionDaysPMs = loggingConf.retention_days_pms || 0;
+        this.retentionCleanupInterval = loggingConf.retention_cleanup_interval || 1440; // Default 24h
         this.stats = Stats.instance().makePrefix('messages');
 
         this.storeQueueLooping = false;
@@ -43,6 +46,14 @@ class SqliteMessageStore {
         )`);
         this.db.exec(`CREATE INDEX IF NOT EXISTS logs_user_id_ts ON logs (user_id, bufferref, time)`);
         this.db.exec(`CREATE INDEX IF NOT EXISTS logs_msgid ON logs (msgid)`);
+        
+        // Indexes required for efficient data cleanup (avoid full table scans)
+        this.db.exec(`CREATE INDEX IF NOT EXISTS logs_bufferref ON logs (bufferref)`);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS logs_msgtagsref ON logs (msgtagsref)`);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS logs_dataref ON logs (dataref)`);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS logs_prefixref ON logs (prefixref)`);
+        this.db.exec(`CREATE INDEX IF NOT EXISTS logs_paramsref ON logs (paramsref)`);
+
         this.db.exec(`
         CREATE TABLE IF NOT EXISTS data (
             id INTEGER PRIMARY KEY,
@@ -65,6 +76,183 @@ class SqliteMessageStore {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         this.stmtGetExistingDataId = this.db.prepare("SELECT id FROM data WHERE data = ?");
+
+        if (this.retentionDaysChannels > 0 || this.retentionDaysPMs > 0) {
+            const runCleanupTask = async () => {
+                if (this.cleanupRunning) return;
+                this.cleanupRunning = true;
+                l.info('Running message retention cleanup');
+                let startTime = Date.now();
+                let totalDeleted = 0;
+                this.stats.increment('retention.cleanup.runs');
+
+                try {
+                    // Reduced batch size to ensure we don't hit SQLite variable limits in runDataCleanup
+                    // 150 rows * 5 columns = 750 variables (limit is 999)
+                    const BATCH_SIZE = 150;
+
+                    const processRetention = async (days, isChannel) => {
+                        if (days <= 0) return;
+                        let more = true;
+                        let busyRetries = 0;
+
+                        while (more) {
+                            // If a transaction is currently open (e.g. from storeMessageLoop), wait
+                            // until it completes to avoid nested transactions or locking issues.
+                            if (this.db.inTransaction) {
+                                if (busyRetries++ > 50) { // Wait max 5 seconds
+                                    l.warn('Database busy with other transactions, aborting retention cleanup');
+                                    return;
+                                }
+                                await new Promise(resolve => setTimeout(resolve, 100));
+                                continue;
+                            }
+                            busyRetries = 0;
+
+                            let rows = [];
+                            // Transaction for the delete batch
+                            this.db.transaction(() => {
+                                rows = this.runRetentionCleanup(days, isChannel, BATCH_SIZE);
+                            })();
+
+                            if (rows.length > 0) {
+                                this.runDataCleanup(rows);
+                                totalDeleted += rows.length;
+                                // Yield to event loop to prevent blocking for too long
+                                await new Promise(resolve => setImmediate(resolve));
+                            }
+
+                            if (rows.length < BATCH_SIZE) {
+                                more = false;
+                            }
+                        }
+                    };
+
+                    if (this.retentionDaysChannels > 0) {
+                        await processRetention(this.retentionDaysChannels, true);
+                    }
+                    if (this.retentionDaysPMs > 0) {
+                        await processRetention(this.retentionDaysPMs, false);
+                    }
+
+                    this.stats.gauge('retention.cleanup.rows_deleted', totalDeleted);
+                    this.stats.gauge('retention.cleanup.duration_ms', Date.now() - startTime);
+                } catch (err) {
+                    l.error('Error running retention cleanup', err);
+                    this.stats.increment('retention.cleanup.errors');
+                } finally {
+                    this.cleanupRunning = false;
+                }
+            };
+
+            runCleanupTask();
+            // Run cleanup periodically
+            setInterval(runCleanupTask, this.retentionCleanupInterval * 60 * 1000);
+        }
+    }
+
+    /**
+     * Cleans up orphaned data in the 'data' table
+     * @param {Array} deletedRows - The rows deleted from the 'logs' table
+     */
+    runDataCleanup(deletedRows) {
+        if (!deletedRows || deletedRows.length === 0) return;
+
+        this.db.transaction(() => {
+            l.info('Running orphaned data cleanup (incremental)');
+            
+            // Extract all unique IDs from the deleted rows
+            const candidateIds = new Set();
+            for (const row of deletedRows) {
+                if (row.bufferref) candidateIds.add(row.bufferref);
+                if (row.msgtagsref) candidateIds.add(row.msgtagsref);
+                if (row.dataref) candidateIds.add(row.dataref);
+                if (row.prefixref) candidateIds.add(row.prefixref);
+                if (row.paramsref) candidateIds.add(row.paramsref);
+            }
+
+            if (candidateIds.size === 0) return;
+            const allIds = Array.from(candidateIds);
+
+            const placeholders = allIds.map(() => '?').join(',');
+
+            // Delete from data ONLY IF the ID is not referenced in any of the 5 columns in logs
+            // We use the UNION ALL optimization inside the NOT EXISTS check
+            const stmt = this.db.prepare(`
+                DELETE FROM data
+                WHERE id IN (${placeholders})
+                AND NOT EXISTS (
+                    SELECT 1 FROM logs WHERE bufferref = data.id
+                    UNION ALL
+                    SELECT 1 FROM logs WHERE msgtagsref = data.id
+                    UNION ALL
+                    SELECT 1 FROM logs WHERE dataref = data.id
+                    UNION ALL
+                    SELECT 1 FROM logs WHERE prefixref = data.id
+                    UNION ALL
+                    SELECT 1 FROM logs WHERE paramsref = data.id
+                    LIMIT 1
+                )
+            `);
+
+            const info = stmt.run(...allIds);
+
+            if (info.changes > 0) {
+                l.info(`Orphaned data cleanup removed ${info.changes} rows`);
+                // Clear the cache to prevent reusing IDs that have just been deleted
+                this.dataCache.reset();
+            }
+        })();
+    }
+
+    /**
+     * Deletes messages exceeding the retention period
+     * @param {number} days - Number of retention days
+     * @param {boolean} isChannel - true for channels (#, &), false for PMs
+     * @param {number} limit - Max number of rows to delete per batch
+     * @returns {Array} Deleted rows with their references
+     */
+    runRetentionCleanup(days, isChannel, limit) {
+        if (days <= 0) return [];
+
+        let cutoffDate = new Date();
+        cutoffDate.setDate(cutoffDate.getDate() - days);
+        let cutoffTime = cutoffDate.getTime();
+
+        let sql;
+        if (isChannel) {
+            sql = `
+                DELETE FROM logs 
+                WHERE rowid IN (
+                    SELECT rowid FROM logs
+                    WHERE time < ? 
+                    AND bufferref IN (
+                        SELECT id FROM data 
+                        WHERE data LIKE '#%' OR data LIKE '&%'
+                    )
+                    LIMIT ?
+                )
+                RETURNING bufferref, msgtagsref, dataref, prefixref, paramsref
+            `;
+        } else {
+            sql = `
+                DELETE FROM logs 
+                WHERE rowid IN (
+                    SELECT rowid FROM logs
+                    WHERE time < ? 
+                    AND bufferref IN (
+                        SELECT id FROM data 
+                        WHERE data NOT LIKE '#%' AND data NOT LIKE '&%'
+                    )
+                    LIMIT ?
+                )
+                RETURNING bufferref, msgtagsref, dataref, prefixref, paramsref
+            `;
+        }
+
+        let rows = this.db.prepare(sql).all(cutoffTime, limit || 1000);
+        l.info(`Retention cleanup (${isChannel ? 'channels' : 'PMs'}, >${days} days) removed ${rows.length} messages`);
+        return rows;
     }
 
     // Insert a chunk of data into the data table if it doesn't already exist, returning its ID
@@ -271,7 +459,7 @@ class SqliteMessageStore {
             toSql = 'AND time < :toTime';
             sqlParams.toTime = to.value;
         } else if (to.type === 'msgid') {
-            toql = 'AND time < (SELECT time FROM logs WHERE msgid = :toMsgid)';
+            toSql = 'AND time < (SELECT time FROM logs WHERE msgid = :toMsgid)';
             sqlParams.toMsgid = to.value;
         }
 
