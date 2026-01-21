@@ -5,6 +5,8 @@ const ConnectionOutgoing = require('./connectionoutgoing');
 const hooks = require('./hooks');
 const strftime = require('strftime');
 
+const yieldToLoop = () => new Promise(resolve => setImmediate(resolve));
+
 // Client commands can be hot reloaded as they contain no state
 let ClientCommands = null;
 
@@ -291,7 +293,8 @@ class ConnectionIncoming {
             if (channel.isChannel && channel.joined) {
                 await this.writeMsgFrom(this.state.nick, 'JOIN', channel.name);
                 channel.topic && await this.writeMsg('TOPIC', channel.name, channel.topic);
-                this.sendNames(channel);
+                await this.sendNames(channel);
+                await yieldToLoop();
             }
         }
 
@@ -301,6 +304,8 @@ class ConnectionIncoming {
             if (buffer.isChannel && !buffer.joined) {
                 continue;
             }
+
+            await yieldToLoop();
 
             let day = (1000 * 60 * 60 * 24);
             let messages = await this.messages.getMessagesBetween(
@@ -319,16 +324,16 @@ class ConnectionIncoming {
             );
 
             let supportsTime = this.state.caps.has('server-time');
-            messages.forEach(async (msg) => {
+            for (const msg of messages) {
                 if (!supportsTime) {
                     msg.params[1] = `[${strftime('%H:%M:%S', new Date(msg.tags.time))}] ${msg.params[1]}`;
                 }
                 await this.writeMsg(msg);
-            });
+            }
         }
     }
 
-    sendNames(buffer) {
+    async sendNames(buffer) {
         let upstream = this.upstream;
         if (!upstream) {
             return;
@@ -362,7 +367,8 @@ class ConnectionIncoming {
         while (names.length > 0) {
             let currentName = names.shift();
             if (len + currentLine.length + 1 + currentName.length > 512) {
-                this.writeMsgFrom(upstream.state.serverPrefix, ...args.concat(currentLine));
+                await this.writeMsgFrom(upstream.state.serverPrefix, ...args.concat(currentLine));
+                await yieldToLoop();
                 currentLine = '';
             }
 
@@ -370,10 +376,10 @@ class ConnectionIncoming {
         }
 
         if (currentLine) {
-            this.writeMsgFrom(upstream.state.serverPrefix, ...args.concat(currentLine));
+            await this.writeMsgFrom(upstream.state.serverPrefix, ...args.concat(currentLine));
         }
 
-        this.writeMsgFrom(upstream.state.serverPrefix, '366', this.state.nick, buffer.name, 'End of /NAMES list.');
+        await this.writeMsgFrom(upstream.state.serverPrefix, '366', this.state.nick, buffer.name, 'End of /NAMES list.');
     }
 
     async updateLastSeen(bufferNames=[]) {
