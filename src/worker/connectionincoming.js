@@ -288,13 +288,17 @@ class ConnectionIncoming {
         let upstream = this.upstream;
 
         // Dump all our joined channels..
+        let channelsProcessed = 0;
         for (let chanName in upstream.state.buffers) {
             let channel = upstream.state.buffers[chanName];
             if (channel.isChannel && channel.joined) {
                 await this.writeMsgFrom(this.state.nick, 'JOIN', channel.name);
                 channel.topic && await this.writeMsg('TOPIC', channel.name, channel.topic);
                 await this.sendNames(channel);
-                await yieldToLoop();
+                channelsProcessed++;
+                if (channelsProcessed % 10 === 0) {
+                    await yieldToLoop();
+                }
             }
         }
 
@@ -364,11 +368,15 @@ class ConnectionIncoming {
         let len = args.reduce((prevVal, curVal) => prevVal + curVal.length, 0);
         len += 2 + upstream.state.serverPrefix.length; // 2 = the : before and space after
         len += args.length; // the spaces between the args
+        let linesSent = 0;
         while (names.length > 0) {
             let currentName = names.shift();
             if (len + currentLine.length + 1 + currentName.length > 512) {
                 await this.writeMsgFrom(upstream.state.serverPrefix, ...args.concat(currentLine));
-                await yieldToLoop();
+                linesSent++;
+                if (linesSent % 5 === 0) {
+                    await yieldToLoop();
+                }
                 currentLine = '';
             }
 
