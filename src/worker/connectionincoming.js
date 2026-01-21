@@ -5,6 +5,8 @@ const ConnectionOutgoing = require('./connectionoutgoing');
 const hooks = require('./hooks');
 const strftime = require('strftime');
 
+const yieldToLoop = () => new Promise(r => setImmediate(r));
+
 // Client commands can be hot reloaded as they contain no state
 let ClientCommands = null;
 
@@ -26,6 +28,10 @@ class ConnectionIncoming {
         this.userDb = userDb;
         this.messages = messages;
         this.cachedUpstreamId = '';
+
+        // Output buffering to reduce IPC message volume
+        this.outBuffer = '';
+        this.outFlushTimer = null;
 
         this.conDict.set(id, this);
     }
@@ -74,6 +80,11 @@ class ConnectionIncoming {
     }
 
     destroy() {
+        if (this.outFlushTimer) {
+            clearImmediate(this.outFlushTimer);
+            this.outFlushTimer = null;
+        }
+
         if (this.upstream) {
             this.upstream.state.unlinkIncomingConnection(this.id);
         }
@@ -83,13 +94,36 @@ class ConnectionIncoming {
     }
 
     close() {
+        this.flushBuffer();
         this.queue.sendToSockets('connection.close', {
             id: this.id,
         });
     }
 
     write(data) {
-        this.queue.sendToSockets('connection.data', {id: this.id, data: data});
+        this.outBuffer += data;
+
+        // Flush immediately if buffer is large enough
+        if (this.outBuffer.length >= 4096) {
+            this.flushBuffer();
+        } else if (!this.outFlushTimer) {
+            // Schedule flush on next tick for small writes
+            this.outFlushTimer = setImmediate(() => this.flushBuffer());
+        }
+    }
+
+    flushBuffer() {
+        if (this.outFlushTimer) {
+            clearImmediate(this.outFlushTimer);
+            this.outFlushTimer = null;
+        }
+
+        if (!this.outBuffer) {
+            return;
+        }
+
+        this.queue.sendToSockets('connection.data', {id: this.id, data: this.outBuffer});
+        this.outBuffer = '';
     }
 
     writeStatus(data) {
@@ -285,22 +319,34 @@ class ConnectionIncoming {
     async dumpChannels() {
         let upstream = this.upstream;
 
-        // Dump all our joined channels..
+        // Dump all our joined channels - fire writes synchronously, yield periodically
+        let channelsProcessed = 0;
         for (let chanName in upstream.state.buffers) {
             let channel = upstream.state.buffers[chanName];
             if (channel.isChannel && channel.joined) {
-                await this.writeMsgFrom(this.state.nick, 'JOIN', channel.name);
-                channel.topic && await this.writeMsg('TOPIC', channel.name, channel.topic);
+                // Fire-and-forget writes (don't await) - batching handles IPC reduction
+                this.writeMsgFrom(this.state.nick, 'JOIN', channel.name);
+                if (channel.topic) {
+                    this.writeMsg('TOPIC', channel.name, channel.topic);
+                }
                 this.sendNames(channel);
+
+                channelsProcessed++;
+                if (channelsProcessed % 5 === 0) {
+                    await yieldToLoop();  // Let other connections process
+                }
             }
         }
 
         // Now the client has a channel list, send any messages we have for them
+        // Yield before each DB query to keep event loop responsive
         for (let buffName in upstream.state.buffers) {
             let buffer = upstream.state.buffers[buffName];
             if (buffer.isChannel && !buffer.joined) {
                 continue;
             }
+
+            await yieldToLoop();  // Yield before each DB query
 
             let day = (1000 * 60 * 60 * 24);
             let messages = await this.messages.getMessagesBetween(
@@ -318,13 +364,14 @@ class ConnectionIncoming {
                 50
             );
 
+            // Fire messages synchronously (batching handles IPC reduction)
             let supportsTime = this.state.caps.has('server-time');
-            messages.forEach(async (msg) => {
+            for (const msg of messages) {
                 if (!supportsTime) {
                     msg.params[1] = `[${strftime('%H:%M:%S', new Date(msg.tags.time))}] ${msg.params[1]}`;
                 }
-                await this.writeMsg(msg);
-            });
+                this.writeMsg(msg);  // No await - fire and forget
+            }
         }
     }
 

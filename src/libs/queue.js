@@ -55,7 +55,10 @@ module.exports = class Queue extends EventEmitter {
         let payload = JSON.stringify([type, data]);
         l.trace('Queue sending to sockets: ' + payload);
         this.stats.increment('sendtosockets');
-        this.channel.sendToQueue(this.queueToSockets, Buffer.from(payload), {persistent: true});
+        // Use non-persistent for connection.data to reduce disk I/O during channel dumps
+        // Data can be regenerated if lost (client will reconnect)
+        let persistent = (type !== 'connection.data');
+        this.channel.sendToQueue(this.queueToSockets, Buffer.from(payload), {persistent});
     }
 
     async listenForEvents() {
