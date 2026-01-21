@@ -30,6 +30,9 @@ class ConnectionIncoming {
         this.cachedUpstreamId = '';
 
         this.conDict.set(id, this);
+
+        this.outBuffer = '';
+        this.outFlushTimer = null;
     }
 
     get id() {
@@ -76,6 +79,11 @@ class ConnectionIncoming {
     }
 
     destroy() {
+        if (this.outFlushTimer) {
+            clearImmediate(this.outFlushTimer);
+            this.outFlushTimer = null;
+        }
+
         if (this.upstream) {
             this.upstream.state.unlinkIncomingConnection(this.id);
         }
@@ -85,13 +93,38 @@ class ConnectionIncoming {
     }
 
     close() {
+        this.flushBuffer();
         this.queue.sendToSockets('connection.close', {
             id: this.id,
         });
     }
 
     write(data) {
-        this.queue.sendToSockets('connection.data', {id: this.id, data: data});
+        if (!this.outBuffer) {
+            this.outBuffer = '';
+        }
+
+        this.outBuffer += data;
+
+        if (this.outBuffer.length >= 4096) {
+            this.flushBuffer();
+        } else if (!this.outFlushTimer) {
+            this.outFlushTimer = setImmediate(() => this.flushBuffer());
+        }
+    }
+
+    flushBuffer() {
+        if (this.outFlushTimer) {
+            clearImmediate(this.outFlushTimer);
+            this.outFlushTimer = null;
+        }
+
+        if (!this.outBuffer) {
+            return;
+        }
+
+        this.queue.sendToSockets('connection.data', {id: this.id, data: this.outBuffer});
+        this.outBuffer = '';
     }
 
     writeStatus(data) {
