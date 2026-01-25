@@ -4,6 +4,8 @@ const hooks = require('./hooks');
 const Helpers = require('../libs/helpers');
 const { ConnectionState, IrcBuffer } = require('./connectionstate');
 
+const yieldToLoop = () => new Promise(r => setImmediate(r));
+
 // Upstream commands can be hot reloaded as they contain no state
 let UpstreamCommands = null;
 
@@ -27,6 +29,9 @@ class ConnectionOutgoing {
         this.messages = messages;
         this.queue = queue;
         this.conDict = conDict;
+
+        // Counter for yielding during high-volume message forwarding (e.g., /list)
+        this.messageForwardCount = 0;
 
         this.conDict.set(id, this);
     }
@@ -161,6 +166,13 @@ class ConnectionOutgoing {
     async messageFromUpstream(message, raw) {
         await this.state.maybeLoad();
 
+        // Yield periodically during high-volume message forwarding (e.g., /list with 5000+ channels)
+        // This prevents blocking the event loop and keeps other connections responsive
+        this.messageForwardCount++;
+        if (this.messageForwardCount % 50 === 0) {
+            await yieldToLoop();
+        }
+
         let passDownstream = await UpstreamCommands.run(message, this);
         if (passDownstream !== false) {
             // Send this data down to any linked clients
@@ -176,7 +188,8 @@ class ConnectionOutgoing {
                 return;
             }
 
-            hook.event.clients.forEach(async client => {
+            // Use for...of instead of forEach to properly handle async
+            for (const client of hook.event.clients) {
                 // Keep track of any changes to our user in this client instance
                 let isUs = message.nick.toLowerCase() === client.state.nick.toLowerCase();
                 if (message.command.toUpperCase() === 'NICK' && isUs) {
@@ -184,8 +197,8 @@ class ConnectionOutgoing {
                     await client.state.save();
                 }
 
-                await client.writeMsg(message);
-            });
+                client.writeMsg(message);  // Fire-and-forget, IPC batching handles efficiency
+            }
         }
     }
 
