@@ -1,10 +1,25 @@
 const ReplyRouter = require('./routes');
 
+// Commands that are never "expected" replies - skip all processing for these
+const PASSTHROUGH_COMMANDS = new Set([
+    'PRIVMSG', 'NOTICE', 'JOIN', 'PART', 'QUIT', 'NICK', 'KICK', 'MODE',
+    'TOPIC', 'INVITE', 'PING', 'PONG', 'ERROR', 'CAP', 'AUTHENTICATE',
+    'TAGMSG', 'AWAY', 'BATCH', 'CHGHOST', 'SETNAME', 'ACCOUNT', 'FAIL',
+    'WARN', 'NOTE'
+]);
+
 module.exports.init = function init(hooks) {
     hooks.on('message_to_clients', event => {
         let command = event.message.command.toUpperCase();
+
+        // Fast path: common commands that are never expected replies
+        // Skip all forEach loops and state lookups for these
+        if (PASSTHROUGH_COMMANDS.has(command)) {
+            return;
+        }
+
         let clientsExpectingMsg = [];
-    
+
         // Populate clientsExpectingMsg with clients expecting this command
         event.clients.forEach(client => {
             let expecting = client.state.tempGet('expecting_replies') || [];
