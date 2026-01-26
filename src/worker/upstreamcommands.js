@@ -470,21 +470,45 @@ commands.NICK = async function(msg, con) {
 commands.PRIVMSG = async function(msg, con) {
     msgIdGenerator.add(msg);
 
+    const bufferName = bufferNameIfPm(msg, con.state.nick, 0);
+
+    // Check if this is a channel message for a channel we've left
+    // Don't forward messages for channels we're not in (prevents channel reopening after /part)
+    if (con.isChannelName(bufferName)) {
+        let buffer = con.state.getBuffer(bufferName);
+        if (buffer && !buffer.joined) {
+            // We've left this channel, don't forward or store the message
+            return false;
+        }
+    }
+
     if (con.state.logging && con.state.netRegistered) {
         await con.messages.storeMessage(msg, con, null);
     }
 
     // Make sure we have this buffer
-    con.state.getOrAddBuffer(bufferNameIfPm(msg, con.state.nick, 0), con);
+    con.state.getOrAddBuffer(bufferName, con);
 };
 
 commands.NOTICE = async function(msg, con) {
     msgIdGenerator.add(msg);
 
+    const bufferName = bufferNameIfPm(msg, con.state.nick, 0);
+
+    // Check if this is a channel notice for a channel we've left
+    // Don't forward messages for channels we're not in (prevents channel reopening after /part)
+    if (bufferName && con.isChannelName(bufferName)) {
+        let buffer = con.state.getBuffer(bufferName);
+        if (buffer && !buffer.joined) {
+            // We've left this channel, don't forward or store the message
+            return false;
+        }
+    }
+
     if (con.state.logging && con.state.netRegistered) {
         await con.messages.storeMessage(msg, con, null);
     }
-    const bufferName = bufferNameIfPm(msg, con.state.nick, 0);
+
     // Some notices come from the server without a nick, don't create an empty buffername for these
     if (bufferName) {
         // Make sure we have this buffer
