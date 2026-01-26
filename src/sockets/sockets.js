@@ -34,7 +34,7 @@ async function run() {
         if (!con) {
             l.debug('Couldn\'t find connection to send data to.', event.id);
         } else {
-            con.write(event.data);
+            con.write(event.data, event.priority || false);
         }
     });
 

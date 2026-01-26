@@ -6,6 +6,11 @@ const { ConnectionState, IrcBuffer } = require('./connectionstate');
 
 const yieldToLoop = () => new Promise(r => setImmediate(r));
 
+// User interactive commands that should bypass throttle for immediate delivery
+const PRIORITY_COMMANDS = new Set([
+    'PRIVMSG', 'NOTICE', 'JOIN', 'PART', 'KICK', 'MODE', 'TOPIC', 'QUIT', 'NICK'
+]);
+
 // Upstream commands can be hot reloaded as they contain no state
 let UpstreamCommands = null;
 
@@ -141,7 +146,12 @@ class ConnectionOutgoing {
                 return;
             }
 
-            this.queue.sendToSockets('connection.data', {id: this.id, data: rawLine + '\r\n'});
+            let isPriority = PRIORITY_COMMANDS.has(msgObj.command.toUpperCase());
+            this.queue.sendToSockets('connection.data', {
+                id: this.id,
+                data: rawLine + '\r\n',
+                priority: isPriority
+            });
         });
     }
 

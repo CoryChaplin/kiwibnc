@@ -21,6 +21,7 @@ module.exports = class SocketConnection extends EventEmitter {
 
         if (sock) {
             this.sock = sock;
+            this.sock.setNoDelay(true);  // Disable Nagle's algorithm for immediate writes
             this.connected = true;
             this.socketLifecycle();
         }
@@ -149,6 +150,7 @@ module.exports = class SocketConnection extends EventEmitter {
         };
 
         sock.setTimeout(opts.connectTimeout || 5000);
+        sock.setNoDelay(true);  // Disable Nagle's algorithm for immediate writes
         sock.connect(connectOpts);
         this.socketLifecycle(useTls ? { servername: opts.servername, tlsverify: opts.tlsverify } : null);
     }
@@ -162,9 +164,12 @@ module.exports = class SocketConnection extends EventEmitter {
         });
     }
 
-    write(data) {
+    write(data, priority = false) {
         if (!this.connected) {
             this.buffer.push(data);
+        } else if (priority) {
+            // Priority messages (user commands) skip throttle for immediate delivery
+            this.forceWrite(data);
         } else {
             this.throttledWrite(data);
         }
