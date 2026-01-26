@@ -80,11 +80,12 @@ module.exports = class SocketConnection extends EventEmitter {
                 this.readBuffer = '';
             }
 
-            lines.forEach((_line) => {
-                let line = _line.replace(/[\r\n]+$/, '');
-                l.debug(`[in ${this.id}]`, [line]);
-                this.queue.sendToWorker('connection.data', {id: this.id, data: line});
-            });
+            // Batch all lines into a single IPC message for efficiency
+            let cleanLines = lines.map(_line => _line.replace(/[\r\n]+$/, ''));
+            if (cleanLines.length > 0) {
+                cleanLines.forEach(line => l.debug(`[in ${this.id}]`, [line]));
+                this.queue.sendToWorker('connection.data.batch', {id: this.id, lines: cleanLines});
+            }
         };
         let onTimeout = () => {
             l.debug(`[timeout ${this.id}]`);
