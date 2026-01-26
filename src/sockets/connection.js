@@ -21,7 +21,10 @@ module.exports = class SocketConnection extends EventEmitter {
 
         if (sock) {
             this.sock = sock;
-            this.sock.setNoDelay(true);  // Disable Nagle's algorithm for immediate writes
+            // Disable Nagle's algorithm for immediate writes (only for TCP sockets, not WebSockets)
+            if (typeof this.sock.setNoDelay === 'function') {
+                this.sock.setNoDelay(true);
+            }
             this.connected = true;
             this.socketLifecycle();
         }
