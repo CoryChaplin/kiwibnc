@@ -250,6 +250,7 @@ function listenToQueue(app) {
 
     // Handle batched data from sockets (more efficient than individual messages)
     app.queue.on('connection.data.batch', async (event) => {
+        l.info(`[BATCH] Received ${event.lines.length} lines for connection ${event.id}`);
         let timer = app.stats.timerStart('worker.process_message_batch_time');
         let con = cons.get(event.id);
         if (!con) {
