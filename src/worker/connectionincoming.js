@@ -4,6 +4,7 @@ const { ConnectionState } = require('./connectionstate');
 const ConnectionOutgoing = require('./connectionoutgoing');
 const hooks = require('./hooks');
 const strftime = require('strftime');
+const { isoTime } = require('../libs/helpers');
 
 const yieldToLoop = () => new Promise(r => setImmediate(r));
 
@@ -150,6 +151,13 @@ class ConnectionIncoming {
             msgObj = msg;
         }
 
+        // Fast path for numeric responses (3-digit commands like WHO 352, LIST 322, etc.)
+        // These don't need full hook processing - just server-time and essential cap handling
+        const cmd = String(msgObj.command || '');
+        if (/^\d{3}$/.test(cmd)) {
+            return this.writeMsgFast(msgObj);
+        }
+
         return hooks.emit('message_to_client', {client: this, message: msgObj, raw: ''}).then(hook => {
             if (hook.prevent) {
                 return;
@@ -180,6 +188,101 @@ class ConnectionIncoming {
 
             this.write(toWrite);
         });
+    }
+
+    // Fast path for numeric messages - skips async hook processing
+    writeMsgFast(msgObj) {
+        const caps = this.state.caps;
+
+        // Handle server-time cap
+        if (caps.has('server-time')) {
+            if (!msgObj.tags['time']) {
+                msgObj.tags['time'] = isoTime();
+            }
+        } else {
+            delete msgObj.tags['time'];
+        }
+
+        // Strip message-tags if client doesn't support them
+        if (!caps.has('message-tags') && !caps.has('server-time')) {
+            msgObj.tags = {};
+        }
+
+        // Handle multi-prefix for 352 (WHO) - strip extra prefixes if client doesn't support
+        if (msgObj.command === '352' && this.upstream) {
+            const clientCaps = caps;
+            const upstreamCaps = this.upstream.state.caps;
+            if (!clientCaps.has('multi-prefix') && upstreamCaps.has('multi-prefix')) {
+                let status = msgObj.params[6] || '';
+                let remapped = '';
+                if (status[0] === 'H' || status[0] === 'A') {
+                    remapped += status[0];
+                    status = status.substr(1);
+                }
+                if (status[0] === '*') {
+                    remapped += status[0];
+                    status = status.substr(1);
+                }
+                if (status[0]) {
+                    remapped += status[0];
+                }
+                msgObj.params[6] = remapped;
+            }
+        }
+
+        // Handle multi-prefix and userhost-in-names for 353 (NAMES)
+        if (msgObj.command === '353' && this.upstream) {
+            const clientCaps = caps;
+            const upstreamCaps = this.upstream.state.caps;
+
+            let prefixes = this.upstream.state.isupports.find(token => token.indexOf('PREFIX=') === 0);
+            prefixes = (prefixes || '').split('=')[1] || '';
+            prefixes = prefixes.substr(prefixes.indexOf(')') + 1);
+
+            let list = msgObj.params[3].split(' ');
+
+            // Process each name in the list
+            list = list.map(item => {
+                // Split prefix and nick
+                let itemPrefixes = '';
+                let nick = '';
+                for (let i = 0; i < item.length; i++) {
+                    if (prefixes.indexOf(item[i]) > -1) {
+                        itemPrefixes += item[i];
+                    } else {
+                        nick = item.substr(i);
+                        break;
+                    }
+                }
+
+                // Strip to single prefix if client doesn't support multi-prefix
+                if (!clientCaps.has('multi-prefix') && upstreamCaps.has('multi-prefix')) {
+                    itemPrefixes = itemPrefixes[0] || '';
+                }
+
+                // Strip userhost if client doesn't support userhost-in-names
+                if (!clientCaps.has('userhost-in-names')) {
+                    let pos = nick.indexOf('!');
+                    if (pos !== -1) {
+                        nick = nick.substring(0, pos);
+                    }
+                }
+
+                return itemPrefixes + nick;
+            });
+
+            msgObj.params[3] = list.join(' ');
+        }
+
+        let toWrite = '';
+        try {
+            toWrite = msgObj.to1459() + '\r\n';
+        } catch (err) {
+            l.error('Error building IRC message for fast write', err.stack);
+            return;
+        }
+
+        this.write(toWrite);
     }
 
     writeMsgFrom(fromMask, command, ...args) {
