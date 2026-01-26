@@ -34,6 +34,10 @@ async function run() {
         if (!con) {
             l.debug('Couldn\'t find connection to send data to.', event.id);
         } else {
+            // DEBUG: Trace outbound message timing for priority messages
+            if (event.priority) {
+                l.info(`[DIAG ${Date.now()}] Sockets received IPC, priority=${event.priority}, writing to socket`);
+            }
             con.write(event.data, event.priority || false);
         }
     });
