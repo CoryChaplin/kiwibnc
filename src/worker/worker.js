@@ -236,11 +236,11 @@ function listenToQueue(app) {
             // DEBUG: Trace outbound message timing
             let isUserCmd = ['PRIVMSG', 'NOTICE', 'JOIN', 'PART'].includes(msg.command.toUpperCase());
             if (isUserCmd) {
-                l.info(`[DIAG ${Date.now()}] Worker received client ${msg.command}: ${event.data.substring(0, 50)}`);
+                l.debug(`[DIAG ${Date.now()}] Worker received client ${msg.command}: ${event.data.substring(0, 50)}`);
             }
             await con.messageFromClient(msg, event.data);
             if (isUserCmd) {
-                l.info(`[DIAG ${Date.now()}] Worker finished processing client ${msg.command}`);
+                l.debug(`[DIAG ${Date.now()}] Worker finished processing client ${msg.command}`);
             }
         } else {
             await con.messageFromUpstream(msg, event.data);

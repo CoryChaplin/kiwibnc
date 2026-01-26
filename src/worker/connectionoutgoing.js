@@ -149,7 +149,7 @@ class ConnectionOutgoing {
             let isPriority = PRIORITY_COMMANDS.has(msgObj.command.toUpperCase());
             // DEBUG: Trace outbound message timing
             if (isPriority) {
-                l.info(`[DIAG ${Date.now()}] Sending to sockets IPC, priority=${isPriority}, cmd=${msgObj.command}`);
+                l.debug(`[DIAG ${Date.now()}] Sending to sockets IPC, priority=${isPriority}, cmd=${msgObj.command}`);
             }
             this.queue.sendToSockets('connection.data', {
                 id: this.id,

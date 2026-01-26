@@ -36,7 +36,7 @@ async function run() {
         } else {
             // DEBUG: Trace outbound message timing for priority messages
             if (event.priority) {
-                l.info(`[DIAG ${Date.now()}] Sockets received IPC, priority=${event.priority}, writing to socket`);
+                l.debug(`[DIAG ${Date.now()}] Sockets received IPC, priority=${event.priority}, writing to socket`);
             }
             con.write(event.data, event.priority || false);
         }
