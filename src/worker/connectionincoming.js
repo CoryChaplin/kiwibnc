@@ -88,6 +88,7 @@ class ConnectionIncoming {
 
         if (this.upstream) {
             this.upstream.state.unlinkIncomingConnection(this.id);
+            this.upstream.whoClientQueue = this.upstream.whoClientQueue.filter(id => id !== this.id);
         }
 
         this.conDict.delete(this.id);
@@ -566,6 +567,10 @@ class ConnectionIncoming {
         }
 
         if (this.upstream && this.upstream.state.connected) {
+            // Track WHO requests so replies stream directly to this client
+            if (message.command.toUpperCase() === 'WHO') {
+                this.upstream.whoClientQueue.push(this.id);
+            }
             this.upstream.write(raw + '\n');
         } else {
             l.debug('No connected upstream, not forwarding client data');

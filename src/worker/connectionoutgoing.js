@@ -11,6 +11,9 @@ const PRIORITY_COMMANDS = new Set([
     'PRIVMSG', 'NOTICE', 'JOIN', 'PART', 'KICK', 'MODE', 'TOPIC', 'QUIT', 'NICK'
 ]);
 
+// WHO reply numerics - streamed directly to requesting client, bypassing hooks/replyrouter
+const WHO_NUMERICS = new Set(['352', '354', '315', '402']);
+
 // Upstream commands can be hot reloaded as they contain no state
 let UpstreamCommands = null;
 
@@ -37,6 +40,9 @@ class ConnectionOutgoing {
 
         // Counter for yielding during high-volume message forwarding (e.g., /list)
         this.messageForwardCount = 0;
+
+        // FIFO queue of client IDs that sent WHO, for direct-streaming replies
+        this.whoClientQueue = [];
 
         this.conDict.set(id, this);
     }
@@ -185,6 +191,20 @@ class ConnectionOutgoing {
         this.messageForwardCount++;
         if (this.messageForwardCount % 50 === 0) {
             await yieldToLoop();
+        }
+
+        // Direct-stream WHO replies to the requesting client, bypassing hooks/replyrouter
+        if (this.whoClientQueue.length > 0 && WHO_NUMERICS.has(message.command)) {
+            let clientId = this.whoClientQueue[0];
+            let client = this.conDict.get(clientId);
+            if (client && client.state.netRegistered) {
+                client.writeMsgFast(message);
+            }
+            // Pop queue on ending reply (315 RPL_ENDOFWHO, 402 ERR_NOSUCHSERVER)
+            if (message.command === '315' || message.command === '402') {
+                this.whoClientQueue.shift();
+            }
+            return;
         }
 
         let passDownstream = await UpstreamCommands.run(message, this);
