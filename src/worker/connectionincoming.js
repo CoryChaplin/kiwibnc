@@ -124,16 +124,6 @@ class ConnectionIncoming {
             return;
         }
 
-        // Track bytes flushed for debugging
-        let prevFlushed = this._bytesFlushed || 0;
-        this._bytesFlushed = prevFlushed + this.outBuffer.length;
-
-        // Log first flush sample during dumpChannels
-        if (prevFlushed === 0 && this._bytesFlushed > 0) {
-            let sample = this.outBuffer.substring(0, 500).replace(/\r/g, '\\r').replace(/\n/g, '\\n');
-            l.info(`[NICKLIST] first flush sample: ${sample}`);
-        }
-
         this.queue.sendToSockets('connection.data', {id: this.id, data: this.outBuffer});
         this.outBuffer = '';
     }
@@ -363,8 +353,6 @@ class ConnectionIncoming {
 
     async registerClient() {
         let upstream = this.upstream;
-        // DEBUG: Log upstream state to diagnose missing nicklist
-        l.info(`[NICKLIST] registerClient start: upstream=${upstream?.id?.slice(0,8)}, loaded=${upstream?.state?.loaded}`);
         this.state.nick = upstream.state.nick;
         this.state.username = upstream.state.username;
         this.state.realname = upstream.state.realname;
@@ -419,11 +407,8 @@ class ConnectionIncoming {
         // If the client supports BOUNCER commands, it will request a buffer list
         // itself and then request messages as needed
         if (!this.state.caps.has('bouncer')) {
-            this._bytesFlushed = 0;  // Reset counter
             await this.dumpChannels();
-            l.info(`[NICKLIST] dumpChannels done, flushed=${this._bytesFlushed} bytes, remaining=${this.outBuffer.length} bytes`);
             this.flushBuffer();  // Ensure NAMES data is sent before registration continues
-            l.info(`[NICKLIST] final flush done, total=${this._bytesFlushed} bytes sent`);
         }
 
         // If we previously set them away, now bring them back
@@ -439,27 +424,22 @@ class ConnectionIncoming {
     async dumpChannels() {
         let upstream = this.upstream;
 
-        // DEBUG: Log buffer state to diagnose missing nicklist
-        let totalUsers = 0;
-        let joinedChans = 0;
-        for (let bname in upstream.state.buffers) {
-            let buf = upstream.state.buffers[bname];
-            if (buf.isChannel && buf.joined) {
-                joinedChans++;
-                totalUsers += Object.keys(buf.users || {}).length;
-            }
-        }
-        l.info(`[NICKLIST] dumpChannels: ${joinedChans} channels, ${totalUsers} total users`);
-
         // Dump all our joined channels - fire writes synchronously, yield periodically
         let channelsProcessed = 0;
         for (let chanName in upstream.state.buffers) {
             let channel = upstream.state.buffers[chanName];
             if (channel.isChannel && channel.joined) {
-                // Fire-and-forget writes (don't await) - batching handles IPC reduction
-                this.writeMsgFrom(this.state.nick, 'JOIN', channel.name);
+                // Write JOIN directly (sync) - writeMsgFrom uses hooks which are async
+                // and would cause NAMES to be written before JOIN
+                let joinMsg = new IrcMessage('JOIN', channel.name);
+                joinMsg.prefix = this.state.nick;
+                this.write(joinMsg.to1459() + '\r\n');
+
                 if (channel.topic) {
-                    this.writeMsg('TOPIC', channel.name, channel.topic);
+                    // TOPIC is also non-numeric, write directly
+                    let topicMsg = new IrcMessage('TOPIC', channel.name, channel.topic);
+                    topicMsg.prefix = upstream.state.serverPrefix;
+                    this.write(topicMsg.to1459() + '\r\n');
                 }
                 this.sendNames(channel);
 
@@ -516,18 +496,6 @@ class ConnectionIncoming {
         let fullMask = this.state.caps.has('userhost-in-names');
         let multiPrefix = this.state.caps.has('multi-prefix');
 
-        // DEBUG: Log warning if buffer has no users
-        let userCount = Object.keys(buffer.users || {}).length;
-        if (userCount === 0) {
-            l.info(`[NICKLIST] WARNING: ${buffer.name} has 0 users`);
-        }
-
-        // Log first NAMES call only
-        if (!this._loggedFirstNames) {
-            this._loggedFirstNames = true;
-            l.info(`[NICKLIST] sendNames called for ${buffer.name} with ${userCount} users`);
-        }
-
         let names = [];
         for (let n in buffer.users) {
             let user = buffer.users[n];
@@ -550,12 +518,10 @@ class ConnectionIncoming {
         let len = args.reduce((prevVal, curVal) => prevVal + curVal.length, 0);
         len += 2 + upstream.state.serverPrefix.length; // 2 = the : before and space after
         len += args.length; // the spaces between the args
-        let namesLinesWritten = 0;
         while (names.length > 0) {
             let currentName = names.shift();
             if (len + currentLine.length + 1 + currentName.length > 512) {
                 this.writeMsgFrom(upstream.state.serverPrefix, ...args.concat(currentLine));
-                namesLinesWritten++;
                 currentLine = '';
             }
 
@@ -564,13 +530,6 @@ class ConnectionIncoming {
 
         if (currentLine) {
             this.writeMsgFrom(upstream.state.serverPrefix, ...args.concat(currentLine));
-            namesLinesWritten++;
-        }
-
-        // Log summary for first channel
-        if (this._loggedFirstNames && !this._loggedFirstNamesComplete) {
-            this._loggedFirstNamesComplete = true;
-            l.info(`[NICKLIST] sendNames wrote ${namesLinesWritten} 353-lines for ${buffer.name}`);
         }
 
         this.writeMsgFrom(upstream.state.serverPrefix, '366', this.state.nick, buffer.name, 'End of /NAMES list.');
