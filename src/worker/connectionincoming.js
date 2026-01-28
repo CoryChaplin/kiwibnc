@@ -408,6 +408,7 @@ class ConnectionIncoming {
         // itself and then request messages as needed
         if (!this.state.caps.has('bouncer')) {
             await this.dumpChannels();
+            this.flushBuffer();  // Ensure NAMES data is sent before registration continues
         }
 
         // If we previously set them away, now bring them back
