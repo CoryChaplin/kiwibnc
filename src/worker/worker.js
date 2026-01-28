@@ -128,6 +128,25 @@ function monitorEventLoop(app) {
 async function prepareShutdown(app) {
     // This worker will get restarted by the sockets process automatically
     l.info('Gracefully shutting down...');
+
+    // Flush all dirty connection states before exiting
+    const savePromises = [];
+    app.cons.map.forEach((con) => {
+        if (con.state._dirty) {
+            if (con.state._saveTimer) {
+                clearTimeout(con.state._saveTimer);
+                con.state._saveTimer = null;
+            }
+            con.state._dirty = false;
+            savePromises.push(con.state.save());
+        }
+    });
+
+    if (savePromises.length > 0) {
+        l.info(`Flushing ${savePromises.length} dirty connection states...`);
+        await Promise.all(savePromises);
+    }
+
     await app.queue.stopListening();
     process.exit();
 }

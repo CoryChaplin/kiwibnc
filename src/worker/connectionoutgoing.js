@@ -228,7 +228,7 @@ class ConnectionOutgoing {
                 let isUs = message.nick.toLowerCase() === client.state.nick.toLowerCase();
                 if (message.command.toUpperCase() === 'NICK' && isUs) {
                     client.state.nick = message.params[0];
-                    await client.state.save();
+                    client.state.markDirty();
                 }
 
                 client.writeMsg(message);  // Fire-and-forget, IPC batching handles efficiency
@@ -295,7 +295,7 @@ class ConnectionOutgoing {
             channel.leave();
         }
 
-        await this.state.save();
+        this.state.markDirty();
 
         hooks.emit('connection_close', {upstream: this});
 

@@ -155,7 +155,7 @@ async function maybeProcessRegistration(con) {
         con.state.authAdmin = !!user.admin;
     }
 
-    await con.state.save();
+    con.state.markDirty();
 
     // If after all the authing above we had a network name but couldn't find a network instance
     // to attach to, fail here
@@ -220,7 +220,7 @@ commands.CAP = async function(msg, con) {
         let requested = mParam(msg, 1, '').split(' ');
         let matched = requested.filter((cap) => availableCaps.has(cap));
         con.state.caps = new Set([...con.state.caps, ...matched]);
-        await con.state.save();
+        con.state.markDirty();
         con.writeFromBnc('CAP', '*', 'ACK', matched.join(' '));
     }
 
@@ -321,7 +321,7 @@ commands.NICK = async function(msg, con) {
     // we will make use of it ourselves first
     if (!con.state.netRegistered) {
         con.state.nick = msg.params[0];
-        con.state.save();
+        con.state.markDirty();
         con.writeMsgFrom(con.state.nick, 'NICK', con.state.nick);
 
         let regState = con.state.tempGet('reg.state');

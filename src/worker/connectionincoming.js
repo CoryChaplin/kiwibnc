@@ -347,7 +347,7 @@ class ConnectionIncoming {
         regLines.forEach(line => this.writeFromBnc(...line));
 
         this.state.netRegistered = true;
-        await this.state.save();
+        this.state.markDirty();
         await hooks.emit('client_registered', {client: this});
     }
 
@@ -416,7 +416,7 @@ class ConnectionIncoming {
             await upstream.state.tempSet('set_away', null);
         }
 
-        await this.state.save();
+        this.state.markDirty();
         await hooks.emit('client_registered', {client: this});
     }
 
@@ -550,7 +550,7 @@ class ConnectionIncoming {
         });
 
         if (changed) {
-            await this.upstream.state.save();
+            this.upstream.state.markDirty();
         }
     }
 
@@ -602,7 +602,7 @@ class ConnectionIncoming {
         if (opts.linkConnections !== false) {
             con.state.linkIncomingConnection(this.id);
         }
-        await con.state.save();
+        con.state.markDirty();
 
         con.open();
 
