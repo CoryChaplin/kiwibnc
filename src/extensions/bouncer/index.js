@@ -3,6 +3,10 @@ const { mParam, mParamU, isoTime, notifyLevel } = require('../../libs/helpers');
 
 let bncApp = null;
 
+function clientSupportsBouncer(client) {
+    return client.state.caps.has('bouncer') || client.state.tempGet('bouncer_requested');
+}
+
 module.exports.init = async function init(hooks, app) {
     bncApp = app;
 
@@ -13,7 +17,7 @@ module.exports.init = async function init(hooks, app) {
         }
 
         app.cons.findAllUsersClients(upstream.state.authUserId).forEach(client => {
-            if (client.state.caps.has('bouncer')) {
+            if (clientSupportsBouncer(client)) {
                 client.writeMsg('BOUNCER', 'state', network.id, network.name, state);
             }
         });
@@ -32,6 +36,31 @@ module.exports.init = async function init(hooks, app) {
         if (event.upstream) {
             sendConnectionState(event.upstream, 'disconnected');
         }
+    });
+
+    // Notify new bouncer clients of already-connected networks
+    hooks.on('client_registered', async (event) => {
+        const client = event.client;
+
+        // Only for clients with bouncer capability
+        if (!clientSupportsBouncer(client)) {
+            return;
+        }
+
+        // Get all user's networks and send state for connected ones
+        const networks = await client.userDb.getUserNetworks(client.state.authUserId);
+
+        for (const network of networks) {
+            const upstream = app.cons.findUsersOutgoingConnection(
+                client.state.authUserId,
+                network.id
+            );
+
+            if (upstream && upstream.state.connected) {
+                await client.writeMsg('BOUNCER', 'state', network.id, network.name, 'connected');
+            }
+        }
+        client.flushBuffer();
     });
 
     hooks.on('message_from_client', event => {
@@ -60,6 +89,7 @@ async function handleBouncerCommand(event) {
 
     let msg = event.message;
     let con = event.client;
+    con.state.tempSet('bouncer_requested', true);
 
     let subCmd = mParamU(msg, 0, '');
     let encodeTags = require('irc-framework/src/messagetags').encode;
@@ -122,7 +152,20 @@ async function handleBouncerCommand(event) {
     }
 
     if (subCmd === 'LISTNETWORKS') {
-        await sendNetworkListToClients(con);
+        await sendNetworkListToClients([con]);
+
+        // After sending the network list, also send state messages for connected networks
+        // KiwiIRC needs these to update the UI properly
+        if (clientSupportsBouncer(con)) {
+            const networks = await con.userDb.getUserNetworks(con.state.authUserId);
+            for (const network of networks) {
+                const upstream = bncApp.cons.findUsersOutgoingConnection(con.state.authUserId, network.id);
+                if (upstream && upstream.state.connected) {
+                    await con.writeMsg('BOUNCER', 'state', network.id, network.name, 'connected');
+                }
+            }
+            con.flushBuffer();
+        }
     }
 
     if (subCmd === 'LISTBUFFERS') {
@@ -488,7 +531,11 @@ async function sendNetworkListToClients(clients) {
 
     lines.push(['BOUNCER', 'listnetworks', 'RPL_OK']);
 
-    clients.forEach((client) => {
-        lines.forEach((line) => client.writeMsg(...line));
-    });
+    for (const client of clients) {
+        // Preserve ordering for KiwiIRC: listnetworks must be fully sent before any state updates.
+        for (const line of lines) {
+            await client.writeMsg(...line);
+        }
+        client.flushBuffer();
+    }
 }
