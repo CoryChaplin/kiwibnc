@@ -190,7 +190,7 @@ async function handleBouncerCommand(event) {
                     network: network.name,
                     buffer: buffer.name,
                 };
-                if (buffer.lastSeen) {
+                if (buffer.lastSeen && buffer.lastSeen[con.state.clientid]) {
                     chan.seen = isoTime(new Date(buffer.lastSeen[con.state.clientid]));
                 }
                 if (buffer.isChannel) {
