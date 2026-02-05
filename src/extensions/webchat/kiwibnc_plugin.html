@@ -576,6 +576,46 @@
 
         kiwi.addStartup('kiwibnc', startupScreen);
 
+        // Track networks reported as connected by the BNC to handle race conditions
+        // (where BNC reports connection before KiwiIRC creates the network object)
+        const connectedBncNetworks = new Set();
+
+        function autoConnectIfReady(network) {
+            if (!network.connection || !network.connection.bncnetid) {
+                return;
+            }
+
+            if (connectedBncNetworks.has(network.connection.bncnetid.toString())) {
+                if (network.state === 'disconnected') {
+                    network.ircClient.connect();
+                }
+            }
+        }
+
+        // Handle BOUNCER state events to auto-connect networks
+        kiwi.on('irc.bouncer state', function(event, network) {
+            if (event.state === 'connected') {
+                connectedBncNetworks.add(event.networkId.toString());
+
+                // Find the network in KiwiIRC that corresponds to this BNC network ID
+                let targetNet = kiwi.state.networks.find(n =>
+                    n.connection && n.connection.bncnetid == event.networkId
+                );
+
+                // If found and currently disconnected, connect it
+                if (targetNet && targetNet.state === 'disconnected') {
+                    targetNet.ircClient.connect();
+                }
+            } else {
+                connectedBncNetworks.delete(event.networkId.toString());
+            }
+        });
+
+        // When new networks are created, check if BNC already reported them as connected
+        kiwi.on('network.new', (event) => {
+            autoConnectIfReady(event.network);
+        });
+
         let adminAdded = false;
         kiwi.on('irc.motd', function(event, network) {
             // kiwibnc admin users get a kiwibnc/admin=token ISUPPORTs token added. The token

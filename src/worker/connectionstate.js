@@ -182,11 +182,26 @@ class ConnectionState {
 
         // Temporary misc data such as CAP negotiation status
         this.tempData = {};
+
+        // Debounced save state
+        this._dirty = false;
+        this._saveTimer = null;
     }
 
     async maybeLoad() {
         if (!this.loaded) {
             await this.load();
+        }
+    }
+
+    markDirty() {
+        this._dirty = true;
+        if (!this._saveTimer) {
+            this._saveTimer = setTimeout(() => {
+                this._saveTimer = null;
+                this._dirty = false;
+                this.save();
+            }, 1000);
         }
     }
 
@@ -357,7 +372,7 @@ class ConnectionState {
         return this.tempData[key];
     }
 
-    async tempSet(key, val) {
+    tempSet(key, val) {
         if (typeof key === 'string') {
             if (val === null) {
                 delete this.tempData[key];
@@ -374,7 +389,7 @@ class ConnectionState {
             }
         }
 
-        await this.save();
+        this.markDirty();
     }
 
     getOrAddBuffer(name, upstreamCon) {
@@ -398,7 +413,7 @@ class ConnectionState {
         }
 
         buffer = this.addBuffer(name, upstreamCon);
-        this.save();
+        this.markDirty();
 
         return buffer;
     }
@@ -464,12 +479,12 @@ class ConnectionState {
 
     linkIncomingConnection(id) {
         this.linkedIncomingConIds.add(id);
-        this.save();
+        this.markDirty();
     }
 
     unlinkIncomingConnection(id) {
         this.linkedIncomingConIds.delete(id);
-        this.save();
+        this.markDirty();
     }
 }
 
