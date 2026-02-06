@@ -30,7 +30,13 @@ class SqliteMessageStore {
     }
 
     async init() {
+        // SQLite performance optimizations
         this.db.pragma('journal_mode = WAL');
+        this.db.pragma('synchronous = NORMAL');     // Safe with WAL, reduces fsync calls
+        this.db.pragma('cache_size = -64000');      // 64MB cache (negative = KB)
+        this.db.pragma('mmap_size = 268435456');    // 256MB memory-mapped I/O
+        this.db.pragma('temp_store = MEMORY');      // Temp tables in RAM
+
         this.db.exec(`
         CREATE TABLE IF NOT EXISTS logs (
             user_id INTEGER,
@@ -282,23 +288,28 @@ class SqliteMessageStore {
 
         let stmt = this.db.prepare(`
             SELECT
-                user_id,
-                network_id,
-                (SELECT data FROM data WHERE id = bufferref) as buffer,
-                time,
-                type,
-                msgid,
-                (SELECT data FROM data WHERE id = msgtagsref) as msgtags,
-                (SELECT data FROM data WHERE id = paramsref) as params,
-                (SELECT data FROM data WHERE id = dataref) as data,
-                (SELECT data FROM data WHERE id = prefixref) as prefix
+                logs.user_id,
+                logs.network_id,
+                d_buffer.data as buffer,
+                logs.time,
+                logs.type,
+                logs.msgid,
+                d_msgtags.data as msgtags,
+                d_params.data as params,
+                d_data.data as data,
+                d_prefix.data as prefix
             FROM logs
+            LEFT JOIN data d_buffer ON logs.bufferref = d_buffer.id
+            LEFT JOIN data d_msgtags ON logs.msgtagsref = d_msgtags.id
+            LEFT JOIN data d_params ON logs.paramsref = d_params.id
+            LEFT JOIN data d_data ON logs.dataref = d_data.id
+            LEFT JOIN data d_prefix ON logs.prefixref = d_prefix.id
             WHERE
-                user_id = :user_id
-                AND network_id = :network_id
-                AND bufferref = (SELECT id FROM data WHERE data = :buffer)
-                AND time > (SELECT time FROM logs WHERE msgid = :msgid)
-            ORDER BY time
+                logs.user_id = :user_id
+                AND logs.network_id = :network_id
+                AND logs.bufferref = (SELECT id FROM data WHERE data = :buffer)
+                AND logs.time > (SELECT time FROM logs WHERE msgid = :msgid)
+            ORDER BY logs.time
             LIMIT :limit
         `);
         let rows = stmt.all({
@@ -320,23 +331,28 @@ class SqliteMessageStore {
 
         let stmt = this.db.prepare(`
             SELECT
-                user_id,
-                network_id,
-                (SELECT data FROM data WHERE id = bufferref) as buffer,
-                time,
-                type,
-                msgid,
-                (SELECT data FROM data WHERE id = msgtagsref) as msgtags,
-                (SELECT data FROM data WHERE id = paramsref) as params,
-                (SELECT data FROM data WHERE id = dataref) as data,
-                (SELECT data FROM data WHERE id = prefixref) as prefix
+                logs.user_id,
+                logs.network_id,
+                d_buffer.data as buffer,
+                logs.time,
+                logs.type,
+                logs.msgid,
+                d_msgtags.data as msgtags,
+                d_params.data as params,
+                d_data.data as data,
+                d_prefix.data as prefix
             FROM logs
+            LEFT JOIN data d_buffer ON logs.bufferref = d_buffer.id
+            LEFT JOIN data d_msgtags ON logs.msgtagsref = d_msgtags.id
+            LEFT JOIN data d_params ON logs.paramsref = d_params.id
+            LEFT JOIN data d_data ON logs.dataref = d_data.id
+            LEFT JOIN data d_prefix ON logs.prefixref = d_prefix.id
             WHERE
-                user_id = :user_id
-                AND network_id = :network_id
-                AND bufferref = (SELECT id FROM data WHERE data = :buffer)
-                AND time > :time
-            ORDER BY time
+                logs.user_id = :user_id
+                AND logs.network_id = :network_id
+                AND logs.bufferref = (SELECT id FROM data WHERE data = :buffer)
+                AND logs.time > :time
+            ORDER BY logs.time
             LIMIT :limit
         `);
         let rows = stmt.all({
@@ -358,23 +374,28 @@ class SqliteMessageStore {
 
         let stmt = this.db.prepare(`
             SELECT
-                user_id,
-                network_id,
-                (SELECT data FROM data WHERE id = bufferref) as buffer,
-                time,
-                type,
-                msgid,
-                (SELECT data FROM data WHERE id = msgtagsref) as msgtags,
-                (SELECT data FROM data WHERE id = paramsref) as params,
-                (SELECT data FROM data WHERE id = dataref) as data,
-                (SELECT data FROM data WHERE id = prefixref) as prefix
+                logs.user_id,
+                logs.network_id,
+                d_buffer.data as buffer,
+                logs.time,
+                logs.type,
+                logs.msgid,
+                d_msgtags.data as msgtags,
+                d_params.data as params,
+                d_data.data as data,
+                d_prefix.data as prefix
             FROM logs
+            LEFT JOIN data d_buffer ON logs.bufferref = d_buffer.id
+            LEFT JOIN data d_msgtags ON logs.msgtagsref = d_msgtags.id
+            LEFT JOIN data d_params ON logs.paramsref = d_params.id
+            LEFT JOIN data d_data ON logs.dataref = d_data.id
+            LEFT JOIN data d_prefix ON logs.prefixref = d_prefix.id
             WHERE
-                user_id = :user_id
-                AND network_id = :network_id
-                AND bufferref = (SELECT id FROM data WHERE data = :buffer)
-                AND time <= (SELECT time FROM logs WHERE msgid = :msgid)
-            ORDER BY time DESC
+                logs.user_id = :user_id
+                AND logs.network_id = :network_id
+                AND logs.bufferref = (SELECT id FROM data WHERE data = :buffer)
+                AND logs.time <= (SELECT time FROM logs WHERE msgid = :msgid)
+            ORDER BY logs.time DESC
             LIMIT :limit
         `);
         let rows = stmt.all({
@@ -398,23 +419,28 @@ class SqliteMessageStore {
 
         let stmt = this.db.prepare(`
             SELECT
-                user_id,
-                network_id,
-                (SELECT data FROM data WHERE id = bufferref) as buffer,
-                time,
-                type,
-                msgid,
-                (SELECT data FROM data WHERE id = msgtagsref) as msgtags,
-                (SELECT data FROM data WHERE id = paramsref) as params,
-                (SELECT data FROM data WHERE id = dataref) as data,
-                (SELECT data FROM data WHERE id = prefixref) as prefix
+                logs.user_id,
+                logs.network_id,
+                d_buffer.data as buffer,
+                logs.time,
+                logs.type,
+                logs.msgid,
+                d_msgtags.data as msgtags,
+                d_params.data as params,
+                d_data.data as data,
+                d_prefix.data as prefix
             FROM logs
+            LEFT JOIN data d_buffer ON logs.bufferref = d_buffer.id
+            LEFT JOIN data d_msgtags ON logs.msgtagsref = d_msgtags.id
+            LEFT JOIN data d_params ON logs.paramsref = d_params.id
+            LEFT JOIN data d_data ON logs.dataref = d_data.id
+            LEFT JOIN data d_prefix ON logs.prefixref = d_prefix.id
             WHERE
-                user_id = :user_id
-                AND network_id = :network_id
-                AND bufferref = (SELECT id FROM data WHERE data = :buffer)
-                AND time <= :time
-            ORDER BY time DESC
+                logs.user_id = :user_id
+                AND logs.network_id = :network_id
+                AND logs.bufferref = (SELECT id FROM data WHERE data = :buffer)
+                AND logs.time <= :time
+            ORDER BY logs.time DESC
             LIMIT :limit
         `);
         let rows = stmt.all({
@@ -465,24 +491,29 @@ class SqliteMessageStore {
 
         let stmt = this.db.prepare(`
             SELECT
-                user_id,
-                network_id,
-                (SELECT data FROM data WHERE id = bufferref) as buffer,
-                time,
-                type,
-                msgid,
-                (SELECT data FROM data WHERE id = msgtagsref) as msgtags,
-                (SELECT data FROM data WHERE id = paramsref) as params,
-                (SELECT data FROM data WHERE id = dataref) as data,
-                (SELECT data FROM data WHERE id = prefixref) as prefix
+                logs.user_id,
+                logs.network_id,
+                d_buffer.data as buffer,
+                logs.time,
+                logs.type,
+                logs.msgid,
+                d_msgtags.data as msgtags,
+                d_params.data as params,
+                d_data.data as data,
+                d_prefix.data as prefix
             FROM logs
+            LEFT JOIN data d_buffer ON logs.bufferref = d_buffer.id
+            LEFT JOIN data d_msgtags ON logs.msgtagsref = d_msgtags.id
+            LEFT JOIN data d_params ON logs.paramsref = d_params.id
+            LEFT JOIN data d_data ON logs.dataref = d_data.id
+            LEFT JOIN data d_prefix ON logs.prefixref = d_prefix.id
             WHERE
-                user_id = :user_id
-                AND network_id = :network_id
-                AND bufferref = (SELECT id FROM data WHERE data = :buffer)
+                logs.user_id = :user_id
+                AND logs.network_id = :network_id
+                AND logs.bufferref = (SELECT id FROM data WHERE data = :buffer)
                 ${fromSql}
                 ${toSql}
-            ORDER BY time DESC
+            ORDER BY logs.time DESC
             LIMIT :limit
         `);
         let rows = stmt.all(sqlParams);

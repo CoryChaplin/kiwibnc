@@ -112,6 +112,25 @@ function broadcastStats(app) {
 async function prepareShutdown(app) {
     // This worker will get restarted by the sockets process automatically
     l.info('Gracefully shutting down...');
+
+    // Flush all dirty connection states before exiting
+    const savePromises = [];
+    app.cons.map.forEach((con) => {
+        if (con.state._dirty) {
+            if (con.state._saveTimer) {
+                clearTimeout(con.state._saveTimer);
+                con.state._saveTimer = null;
+            }
+            con.state._dirty = false;
+            savePromises.push(con.state.save());
+        }
+    });
+
+    if (savePromises.length > 0) {
+        l.info(`Flushing ${savePromises.length} dirty connection states...`);
+        await Promise.all(savePromises);
+    }
+
     await app.queue.stopListening();
     process.exit();
 }
@@ -214,10 +233,57 @@ function listenToQueue(app) {
         }
 
         if (con instanceof ConnectionIncoming) {
+            // DEBUG: Trace outbound message timing
+            let isUserCmd = ['PRIVMSG', 'NOTICE', 'JOIN', 'PART'].includes(msg.command.toUpperCase());
+            if (isUserCmd) {
+                l.debug(`[DIAG ${Date.now()}] Worker received client ${msg.command}: ${event.data.substring(0, 50)}`);
+            }
             await con.messageFromClient(msg, event.data);
+            if (isUserCmd) {
+                l.debug(`[DIAG ${Date.now()}] Worker finished processing client ${msg.command}`);
+            }
         } else {
             await con.messageFromUpstream(msg, event.data);
         }
+    });
+
+    // Handle batched data from sockets (more efficient than individual messages)
+    app.queue.on('connection.data.batch', async (event) => {
+        l.trace(`[BATCH] Received ${event.lines.length} lines for connection ${event.id}`);
+        let timer = app.stats.timerStart('worker.process_message_batch_time');
+        let con = cons.get(event.id);
+        if (!con) {
+            l.warn('Recieved batch data for unknown connection ' + event.id);
+            timer.stop();
+            return;
+        }
+
+        for (const line of event.lines) {
+            let msg = ircLineParser(line);
+            if (!msg) {
+                let snippet = line.substr(0, 300);
+                if (line.length > 300) {
+                    snippet += '...';
+                }
+                l.warn('Recieved malformed IRC line from connection ' + event.id + ' - ' + snippet);
+                continue;
+            }
+
+            if (con instanceof ConnectionIncoming) {
+                // DEBUG: Trace outbound message timing
+                let isUserCmd = ['PRIVMSG', 'NOTICE', 'JOIN', 'PART'].includes(msg.command.toUpperCase());
+                if (isUserCmd) {
+                    l.debug(`[DIAG ${Date.now()}] Worker received client ${msg.command}: ${line.substring(0, 50)}`);
+                }
+                await con.messageFromClient(msg, line);
+                if (isUserCmd) {
+                    l.debug(`[DIAG ${Date.now()}] Worker finished processing client ${msg.command}`);
+                }
+            } else {
+                await con.messageFromUpstream(msg, line);
+            }
+        }
+        timer.stop();
     });
 }
 
