@@ -265,6 +265,25 @@ describe('getOrAddBuffer', () => {
         expect(markDirtySpy).toHaveBeenCalled();
     });
 
+    it('should preserve original nick case when reconstructed via fromObj', () => {
+        const module = require('../../src/worker/connectionstate');
+        const IrcBuffer = module.IrcBuffer;
+
+        const obj = {
+            name: '#test',
+            joined: true,
+            isChannel: true,
+            users: {
+                'jilles': { nick: 'Jilles', host: 'example.com', username: 'jilles', prefixes: ['@'] },
+                'someone': { nick: 'SomeOne', host: 'example.com', username: 'someone', prefixes: [] },
+            },
+            modes: {},
+        };
+        const buffer = IrcBuffer.fromObj(obj);
+        expect(buffer.users['jilles'].nick).toBe('Jilles');
+        expect(buffer.users['someone'].nick).toBe('SomeOne');
+    });
+
     it('should not trigger markDirty when buffer already exists', () => {
         const state = new ConnectionState('test-id', mockDb);
 

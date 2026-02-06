@@ -124,7 +124,7 @@ class IrcBuffer {
             for (let nick in obj.users) {
                 let u = obj.users[nick];
                 if (nick && u && u.nick) {
-                    c.addUser(nick, u);
+                    c.addUser(u.nick, u);
                 }
             }
         }
