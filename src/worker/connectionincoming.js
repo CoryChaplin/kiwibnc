@@ -305,6 +305,43 @@ class ConnectionIncoming {
         return false;
     }
 
+    async syncAvailableCaps() {
+        let availableCaps = new Set();
+        await hooks.emit('available_caps', {client: this, caps: availableCaps});
+        let availableList = Array.from(availableCaps);
+        let previouslyOffered = this.state.tempGet('caps_offered') || [];
+        let previouslyOfferedSet = new Set(previouslyOffered);
+
+        await this.state.tempSet('caps_offered', availableList);
+
+        // No previous CAP LS to compare with, or not yet registered.
+        // Just cache the latest offered list for future diffs.
+        if (!this.state.netRegistered || previouslyOffered.length === 0) {
+            return;
+        }
+
+        let addedCaps = availableList.filter(cap => !previouslyOfferedSet.has(cap));
+        let removedCaps = previouslyOffered.filter(cap => !availableCaps.has(cap));
+        if (addedCaps.length === 0 && removedCaps.length === 0) {
+            return;
+        }
+
+        let serverPrefix = this.upstream ?
+            this.upstream.state.serverPrefix :
+            '*bnc';
+
+        if (this.supportsCapNotify()) {
+            if (addedCaps.length > 0) {
+                this.writeMsgFrom(serverPrefix, 'CAP', this.state.nick, 'NEW', addedCaps.join(' '));
+            }
+            if (removedCaps.length > 0) {
+                this.writeMsgFrom(serverPrefix, 'CAP', this.state.nick, 'DEL', removedCaps.join(' '));
+            }
+        } else {
+            this.writeFromBnc('CAP', '*', 'LS', availableList.join(' '));
+        }
+    }
+
     async registerLocalClient() {
         let regLines = [
             ['001', this.state.nick, 'Welcome to your BNC'],
@@ -416,6 +453,8 @@ class ConnectionIncoming {
             upstream.writeLine('AWAY');
             await upstream.state.tempSet('set_away', null);
         }
+
+        await this.syncAvailableCaps();
 
         this.state.markDirty();
         await hooks.emit('client_registered', {client: this});

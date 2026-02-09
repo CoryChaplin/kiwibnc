@@ -213,6 +213,7 @@ commands.CAP = async function(msg, con) {
         }
 
         await con.state.tempSet('capping', true);
+        await con.state.tempSet('caps_offered', Array.from(availableCaps));
         con.writeFromBnc('CAP', '*', 'LS', Array.from(availableCaps).join(' '));
     }
 
