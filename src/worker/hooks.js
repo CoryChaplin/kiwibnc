@@ -11,6 +11,14 @@ let commandHooks = new EventEmitter();
 module.exports = commandHooks;
 
 commandHooks.addBuiltInHooks = function addBuiltInHooks() {
+    function clientSupportsServerTime(client) {
+        // Kiwi bouncer clients rely on timestamped history to compute unread state
+        // when they bootstrap from CHATHISTORY.
+        return client.state.caps.has('server-time') ||
+            client.state.caps.has('bouncer') ||
+            client.state.tempGet('bouncer_requested');
+    }
+
     // Some caps to always request
     commandHooks.on('available_caps', event => {
         event.caps.add('batch');
@@ -19,9 +27,7 @@ commandHooks.addBuiltInHooks = function addBuiltInHooks() {
 
     // server-time support
     commandHooks.on('message_to_client', event => {
-        let caps = event.client.state.caps;
-
-        if (caps.has('server-time')) {
+        if (clientSupportsServerTime(event.client)) {
             if (!event.message.tags['time']) {
                 event.message.tags['time'] = isoTime();
             }
@@ -125,7 +131,7 @@ commandHooks.addBuiltInHooks = function addBuiltInHooks() {
                 // Some caps when enabled signify that the client can handle message-tags.
                 // If none of these have been requested then assume that the client cannot
                 // handle message-tags at all.
-                if (!event.client.state.caps.has('server-time')) {
+                if (!clientSupportsServerTime(event.client)) {
                     m.tags = {};
                 }
 
