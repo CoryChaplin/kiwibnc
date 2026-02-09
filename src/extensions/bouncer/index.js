@@ -7,6 +7,31 @@ function clientSupportsBouncer(client) {
     return client.state.caps.has('bouncer') || client.state.tempGet('bouncer_requested');
 }
 
+function getLatestSeenTimestamp(buffer) {
+    if (!buffer || typeof buffer !== 'object') {
+        return 0;
+    }
+
+    // Legacy format from older instances.
+    if (typeof buffer.lastSeen === 'number' && isFinite(buffer.lastSeen)) {
+        return buffer.lastSeen;
+    }
+
+    if (!buffer.lastSeen || typeof buffer.lastSeen !== 'object') {
+        return 0;
+    }
+
+    let latest = 0;
+    Object.keys(buffer.lastSeen).forEach((clientId) => {
+        let ts = Number(buffer.lastSeen[clientId]);
+        if (isFinite(ts) && ts > latest) {
+            latest = ts;
+        }
+    });
+
+    return latest;
+}
+
 module.exports.init = async function init(hooks, app) {
     bncApp = app;
 
@@ -190,8 +215,9 @@ async function handleBouncerCommand(event) {
                     network: network.name,
                     buffer: buffer.name,
                 };
-                if (buffer.lastSeen && buffer.lastSeen[con.state.clientid]) {
-                    chan.seen = isoTime(new Date(buffer.lastSeen[con.state.clientid]));
+                let latestSeen = getLatestSeenTimestamp(buffer);
+                if (latestSeen > 0) {
+                    chan.seen = isoTime(new Date(latestSeen));
                 }
                 if (buffer.isChannel) {
                     chan = {
