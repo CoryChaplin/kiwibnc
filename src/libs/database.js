@@ -71,5 +71,11 @@ module.exports = class Database {
         await this.dbUsers.migrate.latest({
             directory: path.join(__dirname, '..', 'dbschemas', 'users'),
         });
+
+        // Optimize connections.db for reduced disk I/O
+        await this.dbConnections.raw('PRAGMA journal_mode = WAL');
+        await this.dbConnections.raw('PRAGMA synchronous = NORMAL');
+        await this.dbConnections.raw('PRAGMA cache_size = -64000');
+        await this.dbConnections.raw('PRAGMA temp_store = MEMORY');
     }
 }
