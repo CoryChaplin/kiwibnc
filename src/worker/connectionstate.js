@@ -1,4 +1,5 @@
 const Helpers = require('../libs/helpers');
+const hooks = require('./hooks');
 
 class IrcUser {
     constructor(nick) {
@@ -414,6 +415,12 @@ class ConnectionState {
 
         buffer = this.addBuffer(name, upstreamCon);
         this.markDirty();
+
+        // Emit hook to notify buffer creation
+        hooks.emit('buffer_added', {
+            upstream: this,
+            buffer: buffer,
+        });
 
         return buffer;
     }

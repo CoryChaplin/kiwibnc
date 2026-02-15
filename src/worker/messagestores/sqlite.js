@@ -527,6 +527,8 @@ class SqliteMessageStore {
     }
 
     async storeMessageLoop() {
+        this.stats.gauge('messagestore.queue_length', this.storeQueue.length);
+
         if (this.storeQueueLooping) {
             return;
         }
