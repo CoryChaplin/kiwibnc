@@ -233,7 +233,39 @@ case "$OUTPUT_FORMAT" in
         [[ -n "$DATE_MAX" ]] && echo "Date max: $DATE_MAX"
         echo ""
         
-        sqlite3 -header -column "$DB_PATH" "$SQL_QUERY"
+        # Fonction pour nettoyer les codes couleur IRC
+        clean_irc_colors() {
+            # Supprime les codes de couleur IRC et de formatage
+            # \x03 = couleur, \x02 = gras, \x1F = souligné, \x16 = inverse, \x0F = reset
+            local text="$1"
+            # Supprimer codes couleur (format: ^C##,## ou ^C##)
+            text=$(echo "$text" | sed -E 's/'$'\x03''[0-9]{1,2}(,[0-9]{1,2})?//g')
+            # Supprimer autres codes de formatage
+            text=$(echo "$text" | sed 's/'$'\x02''//g; s/'$'\x1F''//g; s/'$'\x16''//g; s/'$'\x0F''//g')
+            echo "$text"
+        }
+        
+        # Récupérer et formater les résultats
+        COUNT=0
+        sqlite3 -separator $'\t' "$DB_PATH" "$SQL_QUERY" | while IFS=$'\t' read -r date nick message; do
+            # Nettoyer les codes couleur IRC
+            clean_message=$(clean_irc_colors "$message")
+            
+            # Afficher avec un format lisible
+            echo "┌─ [$date] $nick"
+            
+            # Découper le message en lignes si nécessaire et indenter
+            if command -v fold &> /dev/null; then
+                echo "$clean_message" | fold -s -w 100 | sed 's/^/│  /'
+            else
+                # Fallback si fold n'est pas disponible
+                echo "$clean_message" | sed 's/^/│  /'
+            fi
+            echo "└─────"
+            echo ""
+            
+            COUNT=$((COUNT + 1))
+        done
         
         # Compte le nombre de résultats
         COUNT_QUERY="${SQL_QUERY/SELECT*/SELECT COUNT(*) as count}"
