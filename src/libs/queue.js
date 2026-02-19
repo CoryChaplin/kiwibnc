@@ -75,7 +75,11 @@ module.exports = class Queue extends EventEmitter {
             this.channel = null;
             l.warn('AMQP sendToQueue failed, reconnecting and retrying:', err.message);
             await this.connect();
-            this.channel.sendToQueue(queue, buffer, options);
+            try {
+                this.channel.sendToQueue(queue, buffer, options);
+            } catch (retryErr) {
+                l.error('AMQP sendToQueue failed after reconnect, dropping message:', retryErr.message);
+            }
         }
     }
 
