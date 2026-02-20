@@ -18,6 +18,8 @@ class SqliteMessageStore {
         this.retentionDaysChannels = loggingConf.retention_days_channels || 0;
         this.retentionDaysPMs = loggingConf.retention_days_pms || 0;
         this.retentionCleanupInterval = loggingConf.retention_cleanup_interval || 1440; // Default 24h
+        this.sqliteCacheSize = loggingConf.cache_size || 2000;  // in KB, default 2MB
+        this.sqliteMmapSize = loggingConf.mmap_size || 0;       // in bytes, default disabled
         this.stats = Stats.instance().makePrefix('messages');
 
         this.storeQueueLooping = false;
@@ -33,8 +35,10 @@ class SqliteMessageStore {
         // SQLite performance optimizations
         this.db.pragma('journal_mode = WAL');
         this.db.pragma('synchronous = NORMAL');     // Safe with WAL, reduces fsync calls
-        this.db.pragma('cache_size = -64000');      // 64MB cache (negative = KB)
-        this.db.pragma('mmap_size = 268435456');    // 256MB memory-mapped I/O
+        this.db.pragma(`cache_size = -${this.sqliteCacheSize}`);  // Negative = KB
+        if (this.sqliteMmapSize > 0) {
+            this.db.pragma(`mmap_size = ${this.sqliteMmapSize}`);
+        }
         this.db.pragma('temp_store = MEMORY');      // Temp tables in RAM
 
         this.db.exec(`
