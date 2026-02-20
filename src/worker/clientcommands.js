@@ -269,10 +269,12 @@ commands.NOTICE = async function(msg, con) {
         client.writeMsg(m);
     }, con);
 
-    if (con.upstream && con.upstream.state.logging && con.upstream.state.netRegistered) {
+    // If the server supports echo-message, it will echo the message back and upstreamcommands
+    // will store it then. Storing here would cause a duplicate entry in the history.
+    if (con.upstream && con.upstream.state.logging && con.upstream.state.netRegistered
+            && !con.upstream.state.caps.has('echo-message')) {
         // Add a msgid tag to the message before it's stored. We don't add it to the original
         // message because we don't want it being sent upstream.
-        // TODO: If labeled-response+msgid+echo-message is enabled upstream, dont store the message
         let m = cloneIrcMessage(msg);
         m.tags.msgid = msgId;
         await con.messages.storeMessage(m, con.upstream, con);
@@ -304,10 +306,12 @@ commands.PRIVMSG = async function(msg, con) {
         return false;
     }
 
-    if (con.upstream && con.upstream.state.logging && con.upstream.state.netRegistered) {
+    // If the server supports echo-message, it will echo the message back and upstreamcommands
+    // will store it then. Storing here would cause a duplicate entry in the history.
+    if (con.upstream && con.upstream.state.logging && con.upstream.state.netRegistered
+            && !con.upstream.state.caps.has('echo-message')) {
         // Add a msgid tag to the message before it's stored. We don't add it to the original
         // message because we don't want it being sent upstream.
-        // TODO: If labeled-response+msgid+echo-message is enabled upstream, dont store the message
         let m = cloneIrcMessage(msg);
         m.tags.msgid = msgId;
         await con.messages.storeMessage(m, con.upstream, con);
