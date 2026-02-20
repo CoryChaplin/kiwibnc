@@ -262,7 +262,7 @@ class SqliteMessageStore {
     }
 
     // Insert a chunk of data into the data table if it doesn't already exist, returning its ID
-    async dataId(data) {
+    dataId(data) {
         let cached = this.dataCache.get(data);
         if (cached) {
             return cached;
@@ -587,32 +587,38 @@ class SqliteMessageStore {
         }
 
         let messagesTmr = this.stats.timerStart('store.time');
-        this.db.exec('BEGIN');
 
-        let bufferId = await this.dataId(bufferName);
-        let dataId = await this.dataId(data);
-        let msgtagsId = await this.dataId(JSON.stringify(message.tags));
-        let prefixId = await this.dataId(prefix);
-        let paramsId = await this.dataId(params);
+        // Use better-sqlite3's transaction() instead of raw exec('BEGIN')/exec('COMMIT') so that
+        // db.inTransaction is properly updated. With raw exec('BEGIN'), better-sqlite3 doesn't
+        // track the open transaction, causing runDataCleanup to wrongly think the db is free and
+        // start its own write transaction, which results in SQLITE_BUSY.
+        this.db.transaction(() => {
+            let bufferId = this.dataId(bufferName);
+            let dataId = this.dataId(data);
+            let msgtagsId = this.dataId(JSON.stringify(message.tags));
+            let prefixId = this.dataId(prefix);
+            let paramsId = this.dataId(params);
 
-        this.stmtInsertLogWithId.run(
-            userId,
-            networkId,
-            bufferId,
-            time.getTime(),
-            type,
-            msgId,
-            msgtagsId,
-            dataId,
-            prefixId,
-            paramsId,
-        );
+            this.stmtInsertLogWithId.run(
+                userId,
+                networkId,
+                bufferId,
+                time.getTime(),
+                type,
+                msgId,
+                msgtagsId,
+                dataId,
+                prefixId,
+                paramsId,
+            );
+        })();
 
-        this.db.exec('COMMIT');
         messagesTmr.stop();
 
         this.storeQueueLooping = false;
-        this.storeMessageLoop();
+        // Use setImmediate to schedule the next item, preventing stack overflow on large queues
+        // and allowing other event loop callbacks to run between items.
+        setImmediate(() => this.storeMessageLoop());
     }
 
     async storeMessage(message, upstreamCon, clientCon) {
