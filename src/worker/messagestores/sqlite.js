@@ -20,6 +20,9 @@ class SqliteMessageStore {
         this.retentionCleanupInterval = loggingConf.retention_cleanup_interval || 1440; // Default 24h
         this.sqliteCacheSize = loggingConf.cache_size || 2000;  // in KB, default 2MB
         this.sqliteMmapSize = loggingConf.mmap_size || 0;       // in bytes, default disabled
+        this.connectHistory = loggingConf.connect_history !== undefined
+            ? parseInt(loggingConf.connect_history, 10)
+            : 50; // Messages to replay on client connect (0 = disabled)
         this.stats = Stats.instance().makePrefix('messages');
 
         this.storeQueueLooping = false;
