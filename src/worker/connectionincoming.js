@@ -499,21 +499,34 @@ class ConnectionIncoming {
 
             await yieldToLoop();  // Yield before each DB query
 
+            const maxMessages = this.messages.connectHistory;
+            if (maxMessages === 0) {
+                continue;
+            }
+
             let day = (1000 * 60 * 60 * 24);
+            let since = buffer.lastSeen[this.state.clientid] || Date.now() - (day * 1);
             let messages = await this.messages.getMessagesBetween(
                 this.state.authUserId,
                 this.state.authNetworkId,
                 buffer.name,
-                {
-                    type: 'timestamp',
-                    value: buffer.lastSeen[this.state.clientid] || Date.now() - (day * 1),
-                },
-                {
-                    type: 'timestamp',
-                    value: Date.now(),
-                },
-                50
+                { type: 'timestamp', value: since },
+                { type: 'timestamp', value: Date.now() },
+                maxMessages
             );
+
+            // Fallback: if no messages in the lastSeen→now window and the client doesn't
+            // support CHATHISTORY (e.g. KVirc), send the last N messages so the user
+            // always gets context when connecting.
+            if (messages.length === 0 && !this.state.caps.has('chathistory')) {
+                messages = await this.messages.getMessagesBeforeTime(
+                    this.state.authUserId,
+                    this.state.authNetworkId,
+                    buffer.name,
+                    Date.now(),
+                    maxMessages
+                );
+            }
 
             // Fire messages synchronously (batching handles IPC reduction)
             let supportsTime = this.state.caps.has('server-time');
