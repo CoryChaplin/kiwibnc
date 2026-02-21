@@ -36,6 +36,7 @@ class SqliteMessageStore {
         this.db.pragma('cache_size = -64000');      // 64MB cache (negative = KB)
         this.db.pragma('mmap_size = 268435456');    // 256MB memory-mapped I/O
         this.db.pragma('temp_store = MEMORY');      // Temp tables in RAM
+        this.db.pragma('busy_timeout = 5000');       // Wait up to 5s for locks
 
         this.db.exec(`
         CREATE TABLE IF NOT EXISTS logs (
@@ -122,7 +123,11 @@ class SqliteMessageStore {
                             })();
 
                             if (rows.length > 0) {
-                                this.runDataCleanup(rows);
+                                try {
+                                    this.runDataCleanup(rows);
+                                } catch (cleanupErr) {
+                                    l.warn('Data cleanup failed, will retry next cycle', cleanupErr.message);
+                                }
                                 totalDeleted += rows.length;
                                 // Yield to event loop to prevent blocking for too long
                                 await new Promise(resolve => setImmediate(resolve));
@@ -587,29 +592,41 @@ class SqliteMessageStore {
         }
 
         let messagesTmr = this.stats.timerStart('store.time');
-        this.db.exec('BEGIN');
+        try {
+            this.db.exec('BEGIN');
 
-        let bufferId = await this.dataId(bufferName);
-        let dataId = await this.dataId(data);
-        let msgtagsId = await this.dataId(JSON.stringify(message.tags));
-        let prefixId = await this.dataId(prefix);
-        let paramsId = await this.dataId(params);
+            let bufferId = await this.dataId(bufferName);
+            let dataId = await this.dataId(data);
+            let msgtagsId = await this.dataId(JSON.stringify(message.tags));
+            let prefixId = await this.dataId(prefix);
+            let paramsId = await this.dataId(params);
 
-        this.stmtInsertLogWithId.run(
-            userId,
-            networkId,
-            bufferId,
-            time.getTime(),
-            type,
-            msgId,
-            msgtagsId,
-            dataId,
-            prefixId,
-            paramsId,
-        );
+            this.stmtInsertLogWithId.run(
+                userId,
+                networkId,
+                bufferId,
+                time.getTime(),
+                type,
+                msgId,
+                msgtagsId,
+                dataId,
+                prefixId,
+                paramsId,
+            );
 
-        this.db.exec('COMMIT');
-        messagesTmr.stop();
+            this.db.exec('COMMIT');
+            messagesTmr.stop();
+        } catch (err) {
+            if (this.db.inTransaction) {
+                this.db.exec('ROLLBACK');
+            }
+            if (err.code === 'SQLITE_BUSY') {
+                l.warn('storeMessage: database busy, retrying in 100ms');
+                setTimeout(() => { this.storeQueueLooping = false; this.storeMessageLoop(); }, 100);
+                return;
+            }
+            l.error('storeMessage error', err);
+        }
 
         this.storeQueueLooping = false;
         this.storeMessageLoop();
