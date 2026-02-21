@@ -124,10 +124,22 @@ class SqliteMessageStore {
                             busyRetries = 0;
 
                             let rows = [];
-                            // Transaction for the delete batch
-                            this.db.transaction(() => {
-                                rows = this.runRetentionCleanup(days, isChannel, BATCH_SIZE);
-                            })();
+                            // Transaction for the delete batch — retry on SQLITE_BUSY
+                            let retentionRetries = 0;
+                            while (true) {
+                                try {
+                                    this.db.transaction(() => {
+                                        rows = this.runRetentionCleanup(days, isChannel, BATCH_SIZE);
+                                    })();
+                                    break;
+                                } catch (err) {
+                                    if (err.code === 'SQLITE_BUSY' && retentionRetries++ < 10) {
+                                        await new Promise(resolve => setTimeout(resolve, 200));
+                                        continue;
+                                    }
+                                    throw err;
+                                }
+                            }
 
                             if (rows.length > 0) {
                                 try {
@@ -600,30 +612,39 @@ class SqliteMessageStore {
 
         let messagesTmr = this.stats.timerStart('store.time');
 
-        // Use better-sqlite3's transaction() instead of raw exec('BEGIN')/exec('COMMIT') so that
-        // db.inTransaction is properly updated. With raw exec('BEGIN'), better-sqlite3 doesn't
-        // track the open transaction, causing runDataCleanup to wrongly think the db is free and
-        // start its own write transaction, which results in SQLITE_BUSY.
-        this.db.transaction(() => {
-            let bufferId = this.dataId(bufferName);
-            let dataId = this.dataId(data);
-            let msgtagsId = this.dataId(JSON.stringify(message.tags));
-            let prefixId = this.dataId(prefix);
-            let paramsId = this.dataId(params);
+        try {
+            // Use better-sqlite3's transaction() instead of raw exec('BEGIN')/exec('COMMIT') so that
+            // db.inTransaction is properly updated. With raw exec('BEGIN'), better-sqlite3 doesn't
+            // track the open transaction, causing runDataCleanup to wrongly think the db is free and
+            // start its own write transaction, which results in SQLITE_BUSY.
+            this.db.transaction(() => {
+                let bufferId = this.dataId(bufferName);
+                let dataId = this.dataId(data);
+                let msgtagsId = this.dataId(JSON.stringify(message.tags));
+                let prefixId = this.dataId(prefix);
+                let paramsId = this.dataId(params);
 
-            this.stmtInsertLogWithId.run(
-                userId,
-                networkId,
-                bufferId,
-                time.getTime(),
-                type,
-                msgId,
-                msgtagsId,
-                dataId,
-                prefixId,
-                paramsId,
-            );
-        })();
+                this.stmtInsertLogWithId.run(
+                    userId,
+                    networkId,
+                    bufferId,
+                    time.getTime(),
+                    type,
+                    msgId,
+                    msgtagsId,
+                    dataId,
+                    prefixId,
+                    paramsId,
+                );
+            })();
+        } catch (err) {
+            if (err.code === 'SQLITE_BUSY') {
+                l.warn('storeMessage: database busy, retrying in 100ms');
+                setTimeout(() => { this.storeQueueLooping = false; this.storeMessageLoop(); }, 100);
+                return;
+            }
+            l.error('storeMessage error', err);
+        }
 
         messagesTmr.stop();
 
