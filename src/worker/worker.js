@@ -354,21 +354,30 @@ async function loadConnections(app) {
     let rows = await app.db.dbConnections.raw('SELECT conid, type, bind_host FROM connections');
     l.info(`Loading ${rows.length} connections`);
     let types = ['OUTGOING', 'INCOMING', 'LISTENING'];
-    rows.forEach(async (row) => {
+    for (const row of rows) {
         l.debug(`connection ${row.conid} ${types[row.type]} ${row.bind_host}`);
 
         if (row.type === ConnectionDict.TYPE_INCOMING) {
-            app.cons.loadFromId(row.conid, row.type);
+            await app.cons.loadFromId(row.conid, row.type);
         } else if (row.type === ConnectionDict.TYPE_OUTGOING) {
             let con = await app.cons.loadFromId(row.conid, row.type);
             if (con.state.connected) {
+                // Reset registration state before reconnecting. The DB may have
+                // connected=true from the previous session, but the TCP socket no
+                // longer exists. onUpstreamConnected() will set these back to true
+                // once the connection actually succeeds. Without this reset, clients
+                // see stale channel/nick state from a dead connection.
+                con.state.netRegistered = false;
+                con.state.receivedMotd = false;
+                con.state.connected = false;
+                con.state.markDirty();
                 con.open();
             }
         } else if (row.type === ConnectionDict.TYPE_LISTENING) {
             let parts = parseBindString(row.bind_host);
             if (!parts) {
                 l.error('Invalid listening server type, ' + row.bind_host);
-                return;
+                continue;
             }
             let host = parts.hostname || '0.0.0.0';
             let port = parseInt(parts.port || '6667', 10);
@@ -381,7 +390,7 @@ async function loadConnections(app) {
                 id: row.conid,
             });
         }
-    });
+    }
 }
 
 // Connect to the database, logging warnings if it takes too long
