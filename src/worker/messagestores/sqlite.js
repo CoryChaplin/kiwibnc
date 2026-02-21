@@ -104,6 +104,9 @@ class SqliteMessageStore {
                     // Reduced batch size to ensure we don't hit SQLite variable limits in runDataCleanup
                     // 150 rows * 5 columns = 750 variables (limit is 999)
                     const BATCH_SIZE = 150;
+                    // Collect orphaned data IDs across batches and clean up at the end
+                    // to avoid running expensive NOT EXISTS queries after every small batch
+                    let allDeletedRows = [];
 
                     const processRetention = async (days, isChannel) => {
                         if (days <= 0) return;
@@ -142,14 +145,13 @@ class SqliteMessageStore {
                             }
 
                             if (rows.length > 0) {
-                                try {
-                                    this.runDataCleanup(rows);
-                                } catch (cleanupErr) {
-                                    l.warn('Data cleanup failed, will retry next cycle', cleanupErr.message);
-                                }
+                                allDeletedRows.push(...rows);
                                 totalDeleted += rows.length;
-                                // Yield to event loop to prevent blocking for too long
-                                await new Promise(resolve => setImmediate(resolve));
+                                // Yield to event loop between batches so TCP keepalives,
+                                // reconnections and other I/O can be processed.
+                                // Without this delay, continuous synchronous SQLite writes
+                                // starve the event loop and cause IRC connection timeouts.
+                                await new Promise(resolve => setTimeout(resolve, 50));
                             }
 
                             if (rows.length < BATCH_SIZE) {
@@ -163,6 +165,24 @@ class SqliteMessageStore {
                     }
                     if (this.retentionDaysPMs > 0) {
                         await processRetention(this.retentionDaysPMs, false);
+                    }
+
+                    // Run orphaned data cleanup once at the end instead of per-batch.
+                    // runDataCleanup uses synchronous NOT EXISTS queries that block the
+                    // event loop; doing it once reduces that blocking significantly.
+                    if (allDeletedRows.length > 0) {
+                        // Process in chunks to keep each synchronous block short
+                        const DATA_CLEANUP_CHUNK = 500;
+                        for (let i = 0; i < allDeletedRows.length; i += DATA_CLEANUP_CHUNK) {
+                            let chunk = allDeletedRows.slice(i, i + DATA_CLEANUP_CHUNK);
+                            try {
+                                this.runDataCleanup(chunk);
+                            } catch (cleanupErr) {
+                                l.warn('Data cleanup failed, will retry next cycle', cleanupErr.message);
+                            }
+                            // Yield between chunks
+                            await new Promise(resolve => setTimeout(resolve, 50));
+                        }
                     }
 
                     this.stats.gauge('retention.cleanup.rows_deleted', totalDeleted);
