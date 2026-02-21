@@ -267,6 +267,32 @@ function listenToQueue(app) {
         timer.stop();
     });
 
+    // Handle batched data from sockets (more efficient than individual messages)
+    app.queue.on('connection.data.batch', async (event) => {
+        let con = cons.get(event.id);
+        if (!con) {
+            l.warn('Recieved batch data for unknown connection ' + event.id);
+            return;
+        }
+
+        for (const line of event.lines) {
+            let msg = ircLineParser(line);
+            if (!msg) {
+                let snippet = line.substr(0, 300);
+                if (line.length > 300) {
+                    snippet += '...';
+                }
+                l.warn('Recieved malformed IRC line from connection ' + event.id + ' - ' + snippet);
+                continue;
+            }
+
+            if (con instanceof ConnectionIncoming) {
+                await con.messageFromClient(msg, line);
+            } else {
+                await con.messageFromUpstream(msg, line);
+            }
+        }
+    });
 }
 
 // Start any listening servers on interfaces specified in the config
