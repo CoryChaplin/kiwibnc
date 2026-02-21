@@ -18,6 +18,8 @@ class SqliteMessageStore {
         this.retentionDaysChannels = loggingConf.retention_days_channels || 0;
         this.retentionDaysPMs = loggingConf.retention_days_pms || 0;
         this.retentionCleanupInterval = loggingConf.retention_cleanup_interval || 1440; // Default 24h
+        this.sqliteCacheSize = loggingConf.cache_size || 2000;  // in KB, default 2MB
+        this.sqliteMmapSize = loggingConf.mmap_size || 0;       // in bytes, default disabled
         this.stats = Stats.instance().makePrefix('messages');
 
         this.storeQueueLooping = false;
@@ -33,8 +35,10 @@ class SqliteMessageStore {
         // SQLite performance optimizations
         this.db.pragma('journal_mode = WAL');
         this.db.pragma('synchronous = NORMAL');     // Safe with WAL, reduces fsync calls
-        this.db.pragma('cache_size = -64000');      // 64MB cache (negative = KB)
-        this.db.pragma('mmap_size = 268435456');    // 256MB memory-mapped I/O
+        this.db.pragma(`cache_size = -${this.sqliteCacheSize}`);  // Negative = KB
+        if (this.sqliteMmapSize > 0) {
+            this.db.pragma(`mmap_size = ${this.sqliteMmapSize}`);
+        }
         this.db.pragma('temp_store = MEMORY');      // Temp tables in RAM
         this.db.pragma('busy_timeout = 5000');       // Wait up to 5s for locks
 
@@ -267,7 +271,7 @@ class SqliteMessageStore {
     }
 
     // Insert a chunk of data into the data table if it doesn't already exist, returning its ID
-    async dataId(data) {
+    dataId(data) {
         let cached = this.dataCache.get(data);
         if (cached) {
             return cached;
@@ -592,14 +596,17 @@ class SqliteMessageStore {
         }
 
         let messagesTmr = this.stats.timerStart('store.time');
-        try {
-            this.db.exec('BEGIN');
 
-            let bufferId = await this.dataId(bufferName);
-            let dataId = await this.dataId(data);
-            let msgtagsId = await this.dataId(JSON.stringify(message.tags));
-            let prefixId = await this.dataId(prefix);
-            let paramsId = await this.dataId(params);
+        // Use better-sqlite3's transaction() instead of raw exec('BEGIN')/exec('COMMIT') so that
+        // db.inTransaction is properly updated. With raw exec('BEGIN'), better-sqlite3 doesn't
+        // track the open transaction, causing runDataCleanup to wrongly think the db is free and
+        // start its own write transaction, which results in SQLITE_BUSY.
+        this.db.transaction(() => {
+            let bufferId = this.dataId(bufferName);
+            let dataId = this.dataId(data);
+            let msgtagsId = this.dataId(JSON.stringify(message.tags));
+            let prefixId = this.dataId(prefix);
+            let paramsId = this.dataId(params);
 
             this.stmtInsertLogWithId.run(
                 userId,
@@ -613,23 +620,14 @@ class SqliteMessageStore {
                 prefixId,
                 paramsId,
             );
+        })();
 
-            this.db.exec('COMMIT');
-            messagesTmr.stop();
-        } catch (err) {
-            if (this.db.inTransaction) {
-                this.db.exec('ROLLBACK');
-            }
-            if (err.code === 'SQLITE_BUSY') {
-                l.warn('storeMessage: database busy, retrying in 100ms');
-                setTimeout(() => { this.storeQueueLooping = false; this.storeMessageLoop(); }, 100);
-                return;
-            }
-            l.error('storeMessage error', err);
-        }
+        messagesTmr.stop();
 
         this.storeQueueLooping = false;
-        this.storeMessageLoop();
+        // Use setImmediate to schedule the next item, preventing stack overflow on large queues
+        // and allowing other event loop callbacks to run between items.
+        setImmediate(() => this.storeMessageLoop());
     }
 
     async storeMessage(message, upstreamCon, clientCon) {

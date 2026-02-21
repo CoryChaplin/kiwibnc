@@ -6,9 +6,16 @@ const { ConnectionState, IrcBuffer } = require('./connectionstate');
 
 const yieldToLoop = () => new Promise(r => setImmediate(r));
 
-// User interactive commands that should bypass throttle for immediate delivery
+// User-initiated "fire-and-forget" commands that bypass the write throttle for
+// immediate delivery. Only includes commands whose responses (if any) are
+// identified by distinct IRC numerics, so reordering relative to throttled
+// commands cannot cause response-routing confusion.
+//
+// MODE is intentionally excluded: it serves as both an action and a query,
+// and its query replies could interleave with other pending queries if sent
+// out of throttler order.
 const PRIORITY_COMMANDS = new Set([
-    'PRIVMSG', 'NOTICE', 'JOIN', 'PART', 'KICK', 'MODE', 'TOPIC', 'QUIT', 'NICK'
+    'PRIVMSG', 'NOTICE', 'JOIN', 'PART', 'KICK', 'TOPIC', 'QUIT', 'NICK'
 ]);
 
 // WHO reply numerics - streamed directly to requesting client, bypassing hooks/replyrouter
