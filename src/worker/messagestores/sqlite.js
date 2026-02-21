@@ -40,6 +40,7 @@ class SqliteMessageStore {
             this.db.pragma(`mmap_size = ${this.sqliteMmapSize}`);
         }
         this.db.pragma('temp_store = MEMORY');      // Temp tables in RAM
+        this.db.pragma('busy_timeout = 5000');       // Wait up to 5s for locks
 
         this.db.exec(`
         CREATE TABLE IF NOT EXISTS logs (
@@ -126,7 +127,11 @@ class SqliteMessageStore {
                             })();
 
                             if (rows.length > 0) {
-                                this.runDataCleanup(rows);
+                                try {
+                                    this.runDataCleanup(rows);
+                                } catch (cleanupErr) {
+                                    l.warn('Data cleanup failed, will retry next cycle', cleanupErr.message);
+                                }
                                 totalDeleted += rows.length;
                                 // Yield to event loop to prevent blocking for too long
                                 await new Promise(resolve => setImmediate(resolve));
