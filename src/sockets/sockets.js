@@ -61,10 +61,10 @@ async function run() {
     app.queue.on('connection.open', async (event) => {
         let con = cons.get(event.id);
         if (con && con.connected) {
-            // A connection can only be open once.
-            // This also prevents a worker from restarting and syncing its connection states,
-            // which may request socket opens when they already exist
-            l.debug('Connection already open, ignoring');
+            // Connection already active in sockets - notify the worker so it can
+            // restore its state without re-registering to the IRC network
+            l.debug('Connection already open, notifying worker');
+            app.queue.sendToWorker('connection.existing', {id: con.id});
             return;
         }
 

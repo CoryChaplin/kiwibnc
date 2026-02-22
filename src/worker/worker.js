@@ -214,6 +214,18 @@ function listenToQueue(app) {
             await con.onUpstreamConnected();
         }
     });
+
+    // When the socket layer reports a connection is already active (worker restart scenario)
+    app.queue.on('connection.existing', async (event) => {
+        let con = cons.get(event.id);
+        if (con && con instanceof ConnectionOutgoing) {
+            l.info(`Connection ${event.id} already active in sockets, restoring state`);
+            con.state.connected = true;
+            con.state.netRegistered = true;
+            con.state.receivedMotd = true;
+            con.state.markDirty();
+        }
+    });
     app.queue.on('connection.error', async (event) => {
         l.error(`Server error ${event.id} ${event.error.message}`);
     });
