@@ -43,7 +43,7 @@ class SqliteMessageStore {
             this.db.pragma(`mmap_size = ${this.sqliteMmapSize}`);
         }
         this.db.pragma('temp_store = MEMORY');      // Temp tables in RAM
-        this.db.pragma('busy_timeout = 5000');       // Wait up to 5s for locks
+        this.db.pragma('busy_timeout = 100');        // Short wait for locks; retries are handled async
 
         this.db.exec(`
         CREATE TABLE IF NOT EXISTS logs (
