@@ -17,14 +17,23 @@ function safeSeenIso(val) {
     return isoTime(d);
 }
 
-function buildBufferTags(buffer, networkName, clientid) {
+function buildBufferTags(buffer, networkName) {
     let tags = {
         network: networkName,
         buffer: buffer.name,
     };
 
-    if (buffer.lastSeen && clientid) {
-        let seen = safeSeenIso(buffer.lastSeen[clientid]);
+    if (buffer.lastSeen) {
+        // Use the most recent lastSeen across all clients so that marking a buffer
+        // as read on one client is reflected on every other client for the same user.
+        let maxSeen = 0;
+        for (let cid in buffer.lastSeen) {
+            let ts = Number(buffer.lastSeen[cid]);
+            if (ts > maxSeen) {
+                maxSeen = ts;
+            }
+        }
+        let seen = safeSeenIso(maxSeen);
         if (seen) {
             tags.seen = seen;
         }
@@ -62,7 +71,7 @@ async function sendBufferListToClient(client, network, upstream) {
 
     for (let chanName in upstream.state.buffers) {
         let buffer = upstream.state.buffers[chanName];
-        let tags = buildBufferTags(buffer, network.name, client.state.clientid);
+        let tags = buildBufferTags(buffer, network.name);
         client.writeMsg('BOUNCER', 'listbuffers', network.id, messageTags.encode(tags));
     }
 

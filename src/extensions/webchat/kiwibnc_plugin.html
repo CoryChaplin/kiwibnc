@@ -740,8 +740,11 @@
             }
         });
 
-        // When new networks are created, check if BNC already reported them as connected
+        // When new networks are created, ensure bouncer cap is requested before
+        // any connect. kiwi.on() fires before BouncerProvider's state.$on(), so
+        // without this the cap would be missing if autoConnectIfReady triggers connect.
         kiwi.on('network.new', (event) => {
+            event.network.ircClient.requestCap('bouncer');
             autoConnectIfReady(event.network);
         });
 

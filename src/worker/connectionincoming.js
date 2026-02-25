@@ -515,20 +515,6 @@ class ConnectionIncoming {
                 maxMessages
             );
 
-            // Fallback: if no messages in the lastSeen→now window and the client doesn't
-            // support CHATHISTORY (e.g. KVirc), send the last N messages so the user
-            // always gets context when connecting. Only for joined channels to avoid
-            // a query storm across every PM buffer during reconnection floods.
-            if (messages.length === 0 && !this.state.caps.has('chathistory') && buffer.joined) {
-                messages = await this.messages.getMessagesBeforeTime(
-                    this.state.authUserId,
-                    this.state.authNetworkId,
-                    buffer.name,
-                    Date.now(),
-                    maxMessages
-                );
-            }
-
             // Fire messages synchronously (batching handles IPC reduction)
             let supportsTime = this.state.caps.has('server-time');
             for (const msg of messages) {

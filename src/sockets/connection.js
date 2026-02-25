@@ -181,12 +181,8 @@ module.exports = class SocketConnection extends EventEmitter {
 
     forceWrite(data) {
         l.debug(`[out ${this.id}]`, [data]);
-        // DEBUG: Trace outbound message timing
-        l.debug(`[DIAG ${Date.now()}] forceWrite called, writing to socket now`);
         this.sock.write(data, () => {
             l.trace(`[out ${this.id} complete]`);
-            // DEBUG: Trace when write callback fires
-            l.debug(`[DIAG ${Date.now()}] forceWrite callback, data sent to kernel`);
         });
     }
 }
