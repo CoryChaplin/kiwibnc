@@ -144,6 +144,9 @@
         const bouncerSyncState = {
             listenerAttached: false,
             knownBuffers: new Map(),
+            // Track which networks have completed their initial buffer sync
+            // so we can block bufferSeen() calls until lastSeen is restored
+            syncedNetworks: new Set(),
         };
 
         // Attach bouncer buffer listener immediately to catch early LISTBUFFERS events
@@ -271,6 +274,24 @@
                 }
             });
             bouncerSyncState.knownBuffers.set(key, next);
+
+            // Mark this network as synced so bufferSeen calls are no longer blocked
+            bouncerSyncState.syncedNetworks.add(netId);
+
+            // Cancel any pending markAsRead timers that were started before we
+            // had the real last_read from the bouncer, then re-arm them so that
+            // bufferSeen is sent correctly when the user navigates away.
+            network.buffers.forEach((bufferState) => {
+                if (bufferState.active_timeout) {
+                    clearTimeout(bufferState.active_timeout);
+                    bufferState.active_timeout = null;
+                    // Re-arm: now that syncedNetworks has the netId,
+                    // the gated bufferSeen will let calls through.
+                    if (_.isFunction(bufferState.markAsRead)) {
+                        bufferState.markAsRead(true);
+                    }
+                }
+            });
         }
 
 
@@ -748,8 +769,38 @@
             autoConnectIfReady(event.network);
         });
 
+        // Gate bufferSeen calls: block them until the initial bouncer buffer sync
+        // has completed and restored the real last_read values. Without this,
+        // markAsRead() fires seen=1 (= now) before the bouncer has told us the
+        // real seen timestamp, which resets unread counts on every page reload.
+        //
+        // We patch bufferSeen in the irc.motd handler below — at that point
+        // BouncerMiddleware has already installed bnc on the ircClient.
+        const patchedClients = new WeakSet();
+        function patchBufferSeen(network) {
+            const client = network.ircClient;
+            if (!client || patchedClients.has(client)) {
+                return;
+            }
+            if (!client.bnc || !client.bnc.bufferSeen) {
+                return;
+            }
+
+            patchedClients.add(client);
+            const origBufferSeen = client.bnc.bufferSeen;
+            client.bnc.bufferSeen = function gatedBufferSeen(netId, bufferName, seenTime) {
+                if (!bouncerSyncState.syncedNetworks.has(String(netId))) {
+                    // Bouncer sync hasn't happened yet — discard this seen update
+                    return;
+                }
+                return origBufferSeen.call(this, netId, bufferName, seenTime);
+            };
+        }
+
         let adminAdded = false;
         kiwi.on('irc.motd', function(event, network) {
+            // Patch bufferSeen before triggering the buffer list request
+            patchBufferSeen(network);
             // kiwibnc admin users get a kiwibnc/admin=token ISUPPORTs token added. The token
             // is used for the HTTP admin interface for auth
             let token = network.ircClient.network.supports('kiwibnc/admin');
