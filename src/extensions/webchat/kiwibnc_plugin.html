@@ -258,8 +258,9 @@
                 if (bufferInfo.seen) {
                     const seenTs = Date.parse(bufferInfo.seen);
                     if (Number.isFinite(seenTs)) {
-                        console.log('[KiwiBNC seen] %s: bouncer seen=%s → last_read=%d (was %d)',
-                            bufferName, bufferInfo.seen, seenTs, bufferState.last_read);
+                        console.log('[KiwiBNC seen] ' + bufferName + ': bouncer seen=' + bufferInfo.seen +
+                            ' → last_read=' + seenTs + ' (was ' + bufferState.last_read + ')' +
+                            ' date=' + new Date(seenTs).toISOString());
                         bufferState.last_read = seenTs;
                     }
                 }
@@ -284,9 +285,12 @@
             // had the real last_read from the bouncer, then re-arm them so that
             // bufferSeen is sent correctly when the user navigates away.
             network.buffers.forEach((bufferState) => {
-                console.log('[KiwiBNC seen] timer check %s: active_timeout=%s, last_read=%d, isVisible=%s, unread=%d',
-                    bufferState.name, !!bufferState.active_timeout, bufferState.last_read,
-                    bufferState.flag('is_visible'), bufferState.flag('unread'));
+                console.log('[KiwiBNC seen] timer check ' + bufferState.name +
+                    ': active_timeout=' + !!bufferState.active_timeout +
+                    ', last_read=' + bufferState.last_read +
+                    ' (' + new Date(bufferState.last_read).toISOString() + ')' +
+                    ', isVisible=' + bufferState.flag('is_visible') +
+                    ', unread=' + bufferState.flag('unread'));
                 if (bufferState.active_timeout) {
                     clearTimeout(bufferState.active_timeout);
                     bufferState.active_timeout = null;
@@ -297,6 +301,19 @@
                     }
                 }
             });
+
+            // Delayed check: log state after CHATHISTORY has arrived
+            setTimeout(() => {
+                console.log('[KiwiBNC seen] === POST-CHATHISTORY STATE (15s after sync) ===');
+                network.buffers.forEach((bufferState) => {
+                    if (bufferState.name === '*') return;
+                    console.log('[KiwiBNC seen] FINAL ' + bufferState.name +
+                        ': last_read=' + bufferState.last_read +
+                        ' (' + new Date(bufferState.last_read).toISOString() + ')' +
+                        ', unread=' + bufferState.flag('unread') +
+                        ', messages=' + (bufferState.latest_messages ? bufferState.latest_messages.length : 0));
+                });
+            }, 15000);
         }
 
 
