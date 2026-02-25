@@ -172,7 +172,9 @@ class ConnectionIncoming {
 
             // Update any lastSeen markers if we're sending the client a message of some form. Usually
             // effects clientid usage to prevent re-delivering old chat history.
-            if (['NOTICE', 'PRIVMSG'].includes(String(hook.event.message.command || '').toUpperCase())) {
+            // Skip this for clients with the bouncer cap - they manage lastSeen explicitly
+            // via BOUNCER CHANGEBUFFER seen=<timestamp> when the user actually reads the buffer.
+            if (!this.state.caps.has('bouncer') && ['NOTICE', 'PRIVMSG'].includes(String(hook.event.message.command || '').toUpperCase())) {
                 let message = hook.event.message;
                 let isPm = String(message.params[0]).toLowerCase() === this.state.nick.toLowerCase();
                 let bufName = isPm ? message.nick : message.params[0];
