@@ -181,11 +181,11 @@
                 return n.connection && String(n.connection.bncnetid) === netId;
             });
             if (!targetNet) {
-                console.log('recalculateUnread: no target network for netId=' + netId);
+                console.log('[KiwiBNC] recalculateUnread: no target network for netId=' + netId);
                 return;
             }
 
-            console.log('recalculateUnread: network=' + targetNet.name + ' buffers=' + targetNet.buffers.length);
+            console.log('[KiwiBNC] recalculateUnread: network=' + targetNet.name + ' buffers=' + targetNet.buffers.length);
 
             targetNet.buffers.forEach(function(buf) {
                 // Skip server buffer and currently-viewed buffer
@@ -198,7 +198,7 @@
                     buf.active_timeout = null;
                 }
 
-                // Ensure last_read is set from bouncer seen timestamp
+                // Restore last_read from bouncer seen timestamp
                 if (seenMap) {
                     let seenTs = seenMap.get(buf.name.toLowerCase());
                     if (seenTs) {
@@ -210,38 +210,7 @@
                 // latest_messages which only holds the 5 most recent.
                 let messages = (buf.messagesObj && buf.messagesObj.messages) || [];
 
-                // Detect corrupted last_read: if last_read is newer than ALL
-                // loaded messages, it was likely set to "now" by a previous
-                // buggy reload. In that case, reset it to just before the
-                // oldest loaded message so all history shows as unread.
-                if (messages.length > 0 && buf.last_read > 0) {
-                    let newestMsgTime = 0;
-                    for (let i = 0; i < messages.length; i++) {
-                        let t = messages[i].time;
-                        if (typeof t === 'number' && t > newestMsgTime) {
-                            newestMsgTime = t;
-                        }
-                    }
-                    if (newestMsgTime > 0 && buf.last_read > newestMsgTime) {
-                        // last_read is beyond all loaded messages — likely corrupted.
-                        // Find the oldest message and set last_read just before it
-                        // so the full history batch counts as unread.
-                        let oldestMsgTime = Infinity;
-                        for (let i = 0; i < messages.length; i++) {
-                            let t = messages[i].time;
-                            if (typeof t === 'number' && t < oldestMsgTime) {
-                                oldestMsgTime = t;
-                            }
-                        }
-                        console.log('recalculateUnread: ' + buf.name +
-                            ' last_read (' + new Date(buf.last_read).toISOString() +
-                            ') is newer than newest msg (' + new Date(newestMsgTime).toISOString() +
-                            ') — resetting to oldest msg');
-                        buf.last_read = oldestMsgTime > 0 ? oldestMsgTime - 1 : 0;
-                    }
-                }
-
-                // Recount unread from all loaded messages
+                // Count messages newer than last_read as unread
                 let unread = 0;
                 for (let i = 0; i < messages.length; i++) {
                     let msg = messages[i];
@@ -256,7 +225,7 @@
                     }
                 }
 
-                console.log('recalculateUnread: ' + buf.name +
+                console.log('[KiwiBNC] recalculateUnread: ' + buf.name +
                     ' last_read=' + new Date(buf.last_read).toISOString() +
                     ' messages=' + messages.length +
                     ' unread=' + unread);
