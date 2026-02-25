@@ -258,6 +258,8 @@
                 if (bufferInfo.seen) {
                     const seenTs = Date.parse(bufferInfo.seen);
                     if (Number.isFinite(seenTs)) {
+                        console.log('[KiwiBNC seen] %s: bouncer seen=%s → last_read=%d (was %d)',
+                            bufferName, bufferInfo.seen, seenTs, bufferState.last_read);
                         bufferState.last_read = seenTs;
                     }
                 }
@@ -282,6 +284,9 @@
             // had the real last_read from the bouncer, then re-arm them so that
             // bufferSeen is sent correctly when the user navigates away.
             network.buffers.forEach((bufferState) => {
+                console.log('[KiwiBNC seen] timer check %s: active_timeout=%s, last_read=%d, isVisible=%s, unread=%d',
+                    bufferState.name, !!bufferState.active_timeout, bufferState.last_read,
+                    bufferState.flag('is_visible'), bufferState.flag('unread'));
                 if (bufferState.active_timeout) {
                     clearTimeout(bufferState.active_timeout);
                     bufferState.active_timeout = null;
@@ -790,9 +795,10 @@
             const origBufferSeen = client.bnc.bufferSeen;
             client.bnc.bufferSeen = function gatedBufferSeen(netId, bufferName, seenTime) {
                 if (!bouncerSyncState.syncedNetworks.has(String(netId))) {
-                    // Bouncer sync hasn't happened yet — discard this seen update
+                    console.log('[KiwiBNC seen] BLOCKED bufferSeen(%s, %s) — sync not done yet', netId, bufferName);
                     return;
                 }
+                console.log('[KiwiBNC seen] ALLOWED bufferSeen(%s, %s, %s)', netId, bufferName, seenTime || '1=now');
                 return origBufferSeen.call(this, netId, bufferName, seenTime);
             };
         }
@@ -800,6 +806,7 @@
         let adminAdded = false;
         kiwi.on('irc.motd', function(event, network) {
             // Patch bufferSeen before triggering the buffer list request
+            console.log('[KiwiBNC seen] MOTD received, patching bufferSeen. bnc available:', !!(network.ircClient.bnc && network.ircClient.bnc.bufferSeen));
             patchBufferSeen(network);
             // kiwibnc admin users get a kiwibnc/admin=token ISUPPORTs token added. The token
             // is used for the HTTP admin interface for auth
