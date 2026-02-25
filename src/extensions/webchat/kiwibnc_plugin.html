@@ -148,6 +148,10 @@
         // real seen timestamp, which resets the read position on every reload.
         const syncedNetworks = new Set();
 
+        // Seen timestamps from bouncer buffer lists, saved for delayed recalculation
+        // Map: netId → Map(bufferName.toLowerCase() → timestamp_ms)
+        const pendingSeenTimestamps = new Map();
+
         const patchedClients = new WeakSet();
         function patchBufferSeen(network) {
             const client = network.ircClient;
@@ -166,6 +170,56 @@
                 }
                 return origBufferSeen.call(this, netId, bufferName, seenTime);
             };
+        }
+
+        function recalculateUnread(netId) {
+            let seenMap = pendingSeenTimestamps.get(netId);
+            pendingSeenTimestamps.delete(netId);
+
+            // Find the target BNC network (not the controller connection)
+            let targetNet = kiwi.state.networks.find(function(n) {
+                return n.connection && String(n.connection.bncnetid) === netId;
+            });
+            if (!targetNet) {
+                return;
+            }
+
+            targetNet.buffers.forEach(function(buf) {
+                // Skip server buffer and currently-viewed buffer
+                if (buf.name === '*') return;
+                if (buf.flag('is_visible')) return;
+
+                // Cancel any markAsRead timers that would overwrite last_read
+                if (buf.active_timeout) {
+                    clearTimeout(buf.active_timeout);
+                    buf.active_timeout = null;
+                }
+
+                // Ensure last_read is set from bouncer seen timestamp
+                if (seenMap) {
+                    let seenTs = seenMap.get(buf.name.toLowerCase());
+                    if (seenTs) {
+                        buf.last_read = seenTs;
+                    }
+                }
+
+                // Recount unread from messages loaded via CHATHISTORY
+                let unread = 0;
+                let messages = buf.latest_messages || [];
+                for (let i = 0; i < messages.length; i++) {
+                    let msg = messages[i];
+                    if (msg.time && msg.time >= buf.last_read) {
+                        let type = msg.type || '';
+                        if (['privmsg', 'action', 'notice', 'wallops'].indexOf(type) > -1) {
+                            if (!msg.ignore) {
+                                unread++;
+                            }
+                        }
+                    }
+                }
+
+                buf.flag('unread', unread);
+            });
         }
 
 
@@ -660,10 +714,10 @@
         });
 
         // After BouncerProvider.syncBncNetwork has restored last_read from
-        // bouncer seen timestamps, unblock bufferSeen calls and cancel
-        // any markAsRead timers that fired too early (before last_read
-        // was known). Then let KiwiIRC's native addMessage() count
-        // CHATHISTORY messages as unread using the restored last_read.
+        // bouncer seen timestamps, unblock bufferSeen calls. Then after
+        // CHATHISTORY has had time to load, recalculate unread counts to
+        // handle any timing issues where addMessage() ran before last_read
+        // was properly set.
         kiwi.on('irc.bouncer buffers', (buffers, network) => {
             if (!network) return;
             const netId = String(
@@ -675,17 +729,42 @@
             // Unblock bufferSeen for this network
             syncedNetworks.add(netId);
 
-            // Cancel any markAsRead timers that were armed before
-            // last_read was restored. Do NOT re-arm them — the
-            // native addMessage() flow will handle unread counting
-            // and the user navigating to a buffer will trigger
-            // markAsRead normally.
-            network.buffers.forEach((bufferState) => {
-                if (bufferState.active_timeout) {
-                    clearTimeout(bufferState.active_timeout);
-                    bufferState.active_timeout = null;
+            // Save seen timestamps from the bouncer response. Our handler
+            // fires BEFORE syncBncNetwork (microtask ordering), so we
+            // capture these values to restore last_read later if needed.
+            const seenMap = new Map();
+            (buffers || []).forEach(function(bufferInfo) {
+                const name = String(_.get(bufferInfo, 'name', ''));
+                if (name && bufferInfo.seen) {
+                    const ts = (new Date(bufferInfo.seen)).getTime();
+                    if (Number.isFinite(ts) && ts > 0) {
+                        seenMap.set(name.toLowerCase(), ts);
+                    }
                 }
             });
+            pendingSeenTimestamps.set(netId, seenMap);
+
+            // After syncBncNetwork creates buffers (next microtask), cancel
+            // any markAsRead timers on the correct TARGET network.
+            setTimeout(function() {
+                const targetNet = kiwi.state.networks.find(function(n) {
+                    return n.connection && String(n.connection.bncnetid) === netId;
+                });
+                if (!targetNet) return;
+                targetNet.buffers.forEach(function(buf) {
+                    if (buf.active_timeout) {
+                        clearTimeout(buf.active_timeout);
+                        buf.active_timeout = null;
+                    }
+                });
+            }, 0);
+
+            // After CHATHISTORY has loaded, recalculate unread counts.
+            // This fixes any race conditions where addMessage() ran
+            // before last_read was properly set by syncBncNetwork.
+            setTimeout(function() {
+                recalculateUnread(netId);
+            }, 5000);
         });
     });
 </script>
