@@ -32,10 +32,10 @@
                     <i v-else class="fa fa-spinner fa-spin" aria-hidden="true" ></i>
                 </button>
                 <div @click="showLogin=!showLogin">
-                    <span v-if="showLogin">
+                    <span v-if="showLogin && $state.settings.startupOptions.public_register">
                         <a class="u-link">Create an account</a>
                     </span>
-                    <span v-else>
+                    <span v-else-if="!showLogin">
                         <a class="u-link">
                             <i class="fa fa-chevron-left"></i> I already have an account
                         </a>
