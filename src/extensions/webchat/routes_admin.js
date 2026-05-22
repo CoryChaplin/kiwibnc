@@ -62,7 +62,7 @@ module.exports = function(app) {
     router.post('admin.users', '/api/admin/users', adminAuth, async (ctx, next) => {
         let body = ctx.request.body;
 
-        let acts = ['lock', 'unlock', 'changepass', 'newuser'];
+        let acts = ['lock', 'unlock', 'changepass', 'newuser', 'deleteuser'];
         if (!acts.includes(body.act)) {
             ctx.body = {error: 'unknown_act' };
             return;
@@ -126,6 +126,26 @@ module.exports = function(app) {
                 l.error('[webui] Error adding new user:', err.message);
                 ctx.body = {error: 'unknown_error' };
                 return;
+            }
+
+        } else if (body.act === 'deleteuser') {
+            let adminToken = app.crypt.decrypt(ctx.headers['x-auth']) || '';
+            let adminMatch = adminToken.match(/^userid=(\d+)/);
+            let adminUserId = adminMatch ? parseInt(adminMatch[1]) : null;
+
+            let user = await userDb.getUser(body.username);
+            if (!user) {
+                ctx.body = { error: 'no_user' };
+                return;
+            }
+            if (user.id === adminUserId) {
+                ctx.body = { error: 'cannot_delete_self' };
+                return;
+            }
+
+            await userDb.deleteUser(user.id);
+            if (app.messages) {
+                await app.messages.deleteUserMessages(user.id);
             }
         }
 

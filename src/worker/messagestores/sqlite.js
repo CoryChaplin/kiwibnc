@@ -678,6 +678,10 @@ class SqliteMessageStore {
         this.storeQueue.push({message, upstreamCon, clientCon});
         this.storeMessageLoop();
     }
+
+    deleteUserMessages(userId) {
+        this.db.prepare('DELETE FROM logs WHERE user_id = ?').run(userId);
+    }
 }
 
 module.exports = SqliteMessageStore;

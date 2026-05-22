@@ -116,6 +116,7 @@
                             <button v-else @click.prevent="lockUser(user)" class="u-button u-button-secondary">Lock</button>
 
                             <button @click.prevent="showEditPassword=true" class="u-button u-button-secondary">Change password</button>
+                            <button @click.prevent="deleteUser(user)" class="u-button u-button-secondary" style="float:right;color:red;">Delete user</button>
 
                             <div v-if="showEditPassword">
                                 <input-text v-focus v-model="newPassword" :label="'New password'"></input-text>
@@ -141,96 +142,179 @@
         const Misc = kiwi.require('helpers/Misc');
 
         let adminToken = '';
+        const bouncerSyncState = {
+            listenerAttached: false,
+            knownBuffers: new Map(),
+            // Track which networks have completed their initial buffer sync
+            // so we can block bufferSeen() calls until lastSeen is restored
+            syncedNetworks: new Set(),
+        };
 
-        // Gate bufferSeen calls: block them until the initial bouncer buffer sync
-        // has completed and restored the real last_read values. Without this,
-        // markAsRead() fires seen=1 (= now) before the bouncer has told us the
-        // real seen timestamp, which resets the read position on every reload.
-        const syncedNetworks = new Set();
-
-        // Seen timestamps from bouncer buffer lists, saved for delayed recalculation
-        // Map: netId → Map(bufferName.toLowerCase() → timestamp_ms)
-        const pendingSeenTimestamps = new Map();
-
-        const patchedClients = new WeakSet();
-        function patchBufferSeen(network) {
-            const client = network.ircClient;
-            if (!client || patchedClients.has(client)) {
-                return;
-            }
-            if (!client.bnc || !client.bnc.bufferSeen) {
+        // Attach bouncer buffer listener immediately to catch early LISTBUFFERS events
+        // (before MOTD, during registration)
+        function attachBouncerListener() {
+            if (bouncerSyncState.listenerAttached) {
                 return;
             }
 
-            patchedClients.add(client);
-            const origBufferSeen = client.bnc.bufferSeen;
-            client.bnc.bufferSeen = function gatedBufferSeen(netId, bufferName, seenTime) {
-                if (!syncedNetworks.has(String(netId))) {
-                    return;
-                }
-                return origBufferSeen.call(this, netId, bufferName, seenTime);
-            };
+            bouncerSyncState.listenerAttached = true;
+
+            kiwi.on('irc.bouncer buffers', (buffers, network) => {
+                handleBouncerBuffers(buffers, network);
+            });
         }
 
-        function recalculateUnread(netId) {
-            let seenMap = pendingSeenTimestamps.get(netId);
-            pendingSeenTimestamps.delete(netId);
+        function netStateKey(network, netId) {
+            return `${String(network.id)}:${String(netId || '')}`;
+        }
 
-            // Find the target BNC network (not the controller connection)
-            let targetNet = kiwi.state.networks.find(function(n) {
-                return n.connection && String(n.connection.bncnetid) === netId;
-            });
-            if (!targetNet) {
-                console.log('[KiwiBNC] recalculateUnread: no target network for netId=' + netId);
+        function findBuffer(network, bufferName) {
+            if (!network || !bufferName) {
+                return null;
+            }
+
+            if (_.isFunction(network.bufferByName)) {
+                return network.bufferByName(bufferName) || null;
+            }
+
+            return null;
+        }
+
+        function ensureBufferOpen(network, bufferName) {
+            if (!network || !bufferName) {
+                return;
+            }
+            if (findBuffer(network, bufferName)) {
                 return;
             }
 
-            console.log('[KiwiBNC] recalculateUnread: network=' + targetNet.name + ' buffers=' + targetNet.buffers.length);
+            try {
+                if (kiwi.state && _.isFunction(kiwi.state.addBuffer)) {
+                    kiwi.state.addBuffer(network.id, bufferName);
+                }
+            } catch (err) {
+                log.debug('kiwibnc fallback: unable to open buffer', bufferName, err.message);
+            }
+        }
 
-            targetNet.buffers.forEach(function(buf) {
-                // Skip server buffer and currently-viewed buffer
-                if (buf.name === '*') return;
-                if (buf.flag('is_visible')) return;
+        function ensureBufferClosed(network, bufferName) {
+            if (!network || !bufferName) {
+                return;
+            }
 
-                // Cancel any markAsRead timers that would overwrite last_read
-                if (buf.active_timeout) {
-                    clearTimeout(buf.active_timeout);
-                    buf.active_timeout = null;
+            const buffer = findBuffer(network, bufferName);
+            if (!buffer) {
+                return;
+            }
+
+            try {
+                if (kiwi.state && _.isFunction(kiwi.state.removeBuffer)) {
+                    kiwi.state.removeBuffer(buffer);
+                }
+            } catch (err) {
+                log.debug('kiwibnc fallback: unable to close buffer', bufferName, err.message);
+            }
+        }
+
+        function handleBouncerBuffers(buffers, network) {
+            if (!network) {
+                console.warn('[KiwiBNC] No network in handleBouncerBuffers');
+                return;
+            }
+
+            const detectedNetId = _.get(buffers, '[0].networkId', '');
+            const netId = String(detectedNetId || _.get(network, 'connection.bncnetid', ''));
+            if (!netId) {
+                console.warn('[KiwiBNC] No netId in handleBouncerBuffers', { detectedNetId, bncnetid: network.connection.bncnetid });
+                return;
+            }
+
+            const key = netStateKey(network, netId);
+            const next = new Set();
+            (buffers || []).forEach((bufferInfo) => {
+                const bufferName = String(_.get(bufferInfo, 'name', ''));
+                if (!bufferName) {
+                    return;
                 }
 
-                // Restore last_read from bouncer seen timestamp
-                if (seenMap) {
-                    let seenTs = seenMap.get(buf.name.toLowerCase());
-                    if (seenTs) {
-                        buf.last_read = seenTs;
+                next.add(bufferName);
+                ensureBufferOpen(network, bufferName);
+
+                const bufferState = findBuffer(network, bufferName);
+                if (!bufferState) {
+                    return;
+                }
+
+                if (bufferInfo.topic) {
+                    bufferState.topic = bufferInfo.topic;
+                }
+
+                if (_.has(bufferInfo, 'joined')) {
+                    // Parse joined explicitly: '1' = true, '0' = false
+                    // (truthy coercion would treat '0' string as true)
+                    bufferState.joined = bufferInfo.joined === '1' || bufferInfo.joined === 1 || bufferInfo.joined === true;
+                    bufferState.enabled = bufferState.joined;
+                }
+
+                if (bufferInfo.seen) {
+                    const seenTs = Date.parse(bufferInfo.seen);
+                    if (Number.isFinite(seenTs)) {
+                        console.log('[KiwiBNC seen] ' + bufferName + ': bouncer seen=' + bufferInfo.seen +
+                            ' → last_read=' + seenTs + ' (was ' + bufferState.last_read + ')' +
+                            ' date=' + new Date(seenTs).toISOString());
+                        bufferState.last_read = seenTs;
                     }
                 }
 
-                // Access the full message list (messagesObj.messages), NOT
-                // latest_messages which only holds the 5 most recent.
-                let messages = (buf.messagesObj && buf.messagesObj.messages) || [];
-
-                // Count messages newer than last_read as unread
-                let unread = 0;
-                for (let i = 0; i < messages.length; i++) {
-                    let msg = messages[i];
-                    let t = msg.time;
-                    if (typeof t === 'number' && t >= buf.last_read) {
-                        let type = msg.type || '';
-                        if (['privmsg', 'action', 'notice', 'wallops'].indexOf(type) > -1) {
-                            if (!msg.ignore) {
-                                unread++;
-                            }
-                        }
-                    }
+                if (bufferInfo.notify && _.isFunction(bufferState.setting)) {
+                    bufferState.setting('alert_on', bufferInfo.notify);
                 }
-
-                console.log('[KiwiBNC] recalculateUnread: ' + buf.name +
-                    ' last_read=' + new Date(buf.last_read).toISOString() +
-                    ' messages=' + messages.length +
-                    ' unread=' + unread);
-                buf.flag('unread', unread);
             });
+
+            const prev = bouncerSyncState.knownBuffers.get(key) || new Set();
+            prev.forEach(bufferName => {
+                if (!next.has(bufferName)) {
+                    ensureBufferClosed(network, bufferName);
+                }
+            });
+            bouncerSyncState.knownBuffers.set(key, next);
+
+            // Mark this network as synced so bufferSeen calls are no longer blocked
+            bouncerSyncState.syncedNetworks.add(netId);
+
+            // Cancel any pending markAsRead timers that were started before we
+            // had the real last_read from the bouncer, then re-arm them so that
+            // bufferSeen is sent correctly when the user navigates away.
+            network.buffers.forEach((bufferState) => {
+                console.log('[KiwiBNC seen] timer check ' + bufferState.name +
+                    ': active_timeout=' + !!bufferState.active_timeout +
+                    ', last_read=' + bufferState.last_read +
+                    ' (' + new Date(bufferState.last_read).toISOString() + ')' +
+                    ', isVisible=' + bufferState.flag('is_visible') +
+                    ', unread=' + bufferState.flag('unread'));
+                if (bufferState.active_timeout) {
+                    clearTimeout(bufferState.active_timeout);
+                    bufferState.active_timeout = null;
+                    // Re-arm: now that syncedNetworks has the netId,
+                    // the gated bufferSeen will let calls through.
+                    if (_.isFunction(bufferState.markAsRead)) {
+                        bufferState.markAsRead(true);
+                    }
+                }
+            });
+
+            // Delayed check: log state after CHATHISTORY has arrived
+            setTimeout(() => {
+                console.log('[KiwiBNC seen] === POST-CHATHISTORY STATE (15s after sync) ===');
+                network.buffers.forEach((bufferState) => {
+                    if (bufferState.name === '*') return;
+                    console.log('[KiwiBNC seen] FINAL ' + bufferState.name +
+                        ': last_read=' + bufferState.last_read +
+                        ' (' + new Date(bufferState.last_read).toISOString() + ')' +
+                        ', unread=' + bufferState.flag('unread') +
+                        ', messages=' + (bufferState.latest_messages ? bufferState.latest_messages.length : 0));
+                });
+            }, 15000);
         }
 
 
@@ -632,6 +716,24 @@
                         this.refreshData();
                     });
                 },
+                deleteUser(user) {
+                    if (!confirm(`Supprimer définitivement l'utilisateur "${user.username}" ainsi que tous ses networks et ses logs ?`)) {
+                        return;
+                    }
+                    this.apiCall('/admin/users', {
+                        act: 'deleteuser',
+                        username: user.username,
+                    }).then(resp => {
+                        if (resp.error === 'cannot_delete_self') {
+                            alert('Vous ne pouvez pas supprimer votre propre compte.');
+                        } else if (resp.error) {
+                            alert(`Erreur : ${resp.error}`);
+                        } else {
+                            this.editingUserId = null;
+                            this.refreshData();
+                        }
+                    });
+                },
                 restartBouncer() {
                     this.isRestarting = true;
 
@@ -708,12 +810,40 @@
             autoConnectIfReady(event.network);
         });
 
+        // Gate bufferSeen calls: block them until the initial bouncer buffer sync
+        // has completed and restored the real last_read values. Without this,
+        // markAsRead() fires seen=1 (= now) before the bouncer has told us the
+        // real seen timestamp, which resets unread counts on every page reload.
+        //
+        // We patch bufferSeen in the irc.motd handler below — at that point
+        // BouncerMiddleware has already installed bnc on the ircClient.
+        const patchedClients = new WeakSet();
+        function patchBufferSeen(network) {
+            const client = network.ircClient;
+            if (!client || patchedClients.has(client)) {
+                return;
+            }
+            if (!client.bnc || !client.bnc.bufferSeen) {
+                return;
+            }
+
+            patchedClients.add(client);
+            const origBufferSeen = client.bnc.bufferSeen;
+            client.bnc.bufferSeen = function gatedBufferSeen(netId, bufferName, seenTime) {
+                if (!bouncerSyncState.syncedNetworks.has(String(netId))) {
+                    console.log('[KiwiBNC seen] BLOCKED bufferSeen(%s, %s) — sync not done yet', netId, bufferName);
+                    return;
+                }
+                console.log('[KiwiBNC seen] ALLOWED bufferSeen(%s, %s, %s)', netId, bufferName, seenTime || '1=now');
+                return origBufferSeen.call(this, netId, bufferName, seenTime);
+            };
+        }
+
         let adminAdded = false;
         kiwi.on('irc.motd', function(event, network) {
-            // Patch bufferSeen to gate calls until BouncerProvider.syncBncNetwork
-            // has restored the real last_read from the bouncer's seen timestamps.
+            // Patch bufferSeen before triggering the buffer list request
+            console.log('[KiwiBNC seen] MOTD received, patching bufferSeen. bnc available:', !!(network.ircClient.bnc && network.ircClient.bnc.bufferSeen));
             patchBufferSeen(network);
-
             // kiwibnc admin users get a kiwibnc/admin=token ISUPPORTs token added. The token
             // is used for the HTTP admin interface for auth
             let token = network.ircClient.network.supports('kiwibnc/admin');
@@ -722,61 +852,21 @@
                 adminToken = token;
                 kiwi.addTab('settings', 'KiwiBNC Admin', AdminScreen);
             }
-        });
 
-        // After BouncerProvider.syncBncNetwork has restored last_read from
-        // bouncer seen timestamps, unblock bufferSeen calls. Then after
-        // CHATHISTORY has had time to load, recalculate unread counts to
-        // handle any timing issues where addMessage() ran before last_read
-        // was properly set.
-        kiwi.on('irc.bouncer buffers', (buffers, network) => {
-            if (!network) return;
-            const netId = String(
-                _.get(buffers, '[0].networkId', '') ||
-                _.get(network, 'connection.bncnetid', '')
-            );
-            if (!netId) return;
-
-            // Unblock bufferSeen for this network
-            syncedNetworks.add(netId);
-
-            // Save seen timestamps from the bouncer response. Our handler
-            // fires BEFORE syncBncNetwork (microtask ordering), so we
-            // capture these values to restore last_read later if needed.
-            const seenMap = new Map();
-            (buffers || []).forEach(function(bufferInfo) {
-                const name = String(_.get(bufferInfo, 'name', ''));
-                if (name && bufferInfo.seen) {
-                    const ts = (new Date(bufferInfo.seen)).getTime();
-                    if (Number.isFinite(ts) && ts > 0) {
-                        seenMap.set(name.toLowerCase(), ts);
-                    }
+            // Sync bouncer buffers at MOTD (like KiwiIRC native BouncerProvider)
+            // The BouncerMiddleware adds bnc.tags() method to decode the bouncer CAP token
+            if (network.ircClient.bnc && network.ircClient.bnc.hasNetwork()) {
+                let netId = network.ircClient.bnc.tags().netid;
+                if (netId) {
+                    network.connection.bncnetid = netId;
+                    // Request buffer list from bouncer - listener will handle the response
+                    network.ircClient.raw('BOUNCER listbuffers ' + netId);
                 }
-            });
-            pendingSeenTimestamps.set(netId, seenMap);
-
-            // After syncBncNetwork creates buffers (next microtask), cancel
-            // any markAsRead timers on the correct TARGET network.
-            setTimeout(function() {
-                const targetNet = kiwi.state.networks.find(function(n) {
-                    return n.connection && String(n.connection.bncnetid) === netId;
-                });
-                if (!targetNet) return;
-                targetNet.buffers.forEach(function(buf) {
-                    if (buf.active_timeout) {
-                        clearTimeout(buf.active_timeout);
-                        buf.active_timeout = null;
-                    }
-                });
-            }, 0);
-
-            // After CHATHISTORY has loaded, recalculate unread counts.
-            // This fixes any race conditions where addMessage() ran
-            // before last_read was properly set by syncBncNetwork.
-            setTimeout(function() {
-                recalculateUnread(netId);
-            }, 5000);
+            }
         });
+
+        // Attach listener immediately on plugin load
+        attachBouncerListener();
     });
 </script>
 

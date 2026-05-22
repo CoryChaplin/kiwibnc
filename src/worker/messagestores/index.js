@@ -82,6 +82,14 @@ class MessageStores {
             await store.storeMessage(...args);
         });
     }
+
+    async deleteUserMessages(userId) {
+        for (const store of this.stores) {
+            if (typeof store.deleteUserMessages === 'function') {
+                await store.deleteUserMessages(userId);
+            }
+        }
+    }
 }
 
 module.exports = MessageStores;
