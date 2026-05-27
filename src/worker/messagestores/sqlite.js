@@ -113,12 +113,29 @@ class SqliteMessageStore {
                         let more = true;
                         let busyRetries = 0;
 
+                        // Pre-compute the set of matching buffer IDs ONCE into a temp table.
+                        //
+                        // Without this, runRetentionCleanup's IN-subquery runs a full table scan
+                        // of the 'data' table on every batch call. The 'data' column has BLOB
+                        // affinity, so SQLite cannot use the UNIQUE index for LIKE comparisons
+                        // (LIKE index optimisation only applies to TEXT affinity columns). On a
+                        // large database the scan takes several seconds and blocks the event loop
+                        // for the entire duration, stalling HTTP requests and IRC keepalives.
+                        const tempBufs = isChannel ? 'tmp_ret_ch_bufs' : 'tmp_ret_pm_bufs';
+                        this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
+                        const bufSql = isChannel
+                            ? `CREATE TEMP TABLE ${tempBufs} AS SELECT id FROM data WHERE CAST(data AS TEXT) LIKE '#%' OR CAST(data AS TEXT) LIKE '&%'`
+                            : `CREATE TEMP TABLE ${tempBufs} AS SELECT id FROM data WHERE CAST(data AS TEXT) NOT LIKE '#%' AND CAST(data AS TEXT) NOT LIKE '&%'`;
+                        this.db.exec(bufSql);
+                        this.db.exec(`CREATE INDEX idx_${tempBufs} ON ${tempBufs}(id)`);
+
                         while (more) {
                             // If a transaction is currently open (e.g. from storeMessageLoop), wait
                             // until it completes to avoid nested transactions or locking issues.
                             if (this.db.inTransaction) {
                                 if (busyRetries++ > 50) { // Wait max 5 seconds
                                     l.warn('Database busy with other transactions, aborting retention cleanup');
+                                    this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
                                     return;
                                 }
                                 await new Promise(resolve => setTimeout(resolve, 100));
@@ -132,7 +149,7 @@ class SqliteMessageStore {
                             while (true) {
                                 try {
                                     this.db.transaction(() => {
-                                        rows = this.runRetentionCleanup(days, isChannel, BATCH_SIZE);
+                                        rows = this.runRetentionCleanup(days, isChannel, BATCH_SIZE, tempBufs);
                                     })();
                                     break;
                                 } catch (err) {
@@ -158,6 +175,8 @@ class SqliteMessageStore {
                                 more = false;
                             }
                         }
+
+                        this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
                     };
 
                     if (this.retentionDaysChannels > 0) {
@@ -262,7 +281,7 @@ class SqliteMessageStore {
      * @param {number} limit - Max number of rows to delete per batch
      * @returns {Array} Deleted rows with their references
      */
-    runRetentionCleanup(days, isChannel, limit) {
+    runRetentionCleanup(days, isChannel, limit, bufTableName) {
         if (days <= 0) return [];
 
         let cutoffDate = new Date();
@@ -270,14 +289,27 @@ class SqliteMessageStore {
         let cutoffTime = cutoffDate.getTime();
 
         let sql;
-        if (isChannel) {
+        if (bufTableName) {
+            // Use the pre-computed temp table of buffer IDs (avoids repeated full table
+            // scan of the data column which has BLOB affinity and cannot use LIKE index).
             sql = `
-                DELETE FROM logs 
+                DELETE FROM logs
+                WHERE rowid IN (
+                    SELECT l.rowid FROM logs l
+                    INNER JOIN ${bufTableName} b ON l.bufferref = b.id
+                    WHERE l.time < ?
+                    LIMIT ?
+                )
+                RETURNING bufferref, msgtagsref, dataref, prefixref, paramsref
+            `;
+        } else if (isChannel) {
+            sql = `
+                DELETE FROM logs
                 WHERE rowid IN (
                     SELECT rowid FROM logs
-                    WHERE time < ? 
+                    WHERE time < ?
                     AND bufferref IN (
-                        SELECT id FROM data 
+                        SELECT id FROM data
                         WHERE data LIKE '#%' OR data LIKE '&%'
                     )
                     LIMIT ?
@@ -286,12 +318,12 @@ class SqliteMessageStore {
             `;
         } else {
             sql = `
-                DELETE FROM logs 
+                DELETE FROM logs
                 WHERE rowid IN (
                     SELECT rowid FROM logs
-                    WHERE time < ? 
+                    WHERE time < ?
                     AND bufferref IN (
-                        SELECT id FROM data 
+                        SELECT id FROM data
                         WHERE data NOT LIKE '#%' AND data NOT LIKE '&%'
                     )
                     LIMIT ?
