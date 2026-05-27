@@ -355,13 +355,20 @@ async function startServers(app) {
 }
 
 async function loadConnections(app) {
-    let rows = await app.db.dbConnections.raw('SELECT conid, type, bind_host FROM connections');
+    let rows = await app.db.dbConnections.raw('SELECT conid, type, bind_host, auth_user_id FROM connections');
     l.info(`Loading ${rows.length} connections`);
     let types = ['OUTGOING', 'INCOMING', 'LISTENING'];
     for (const row of rows) {
         l.debug(`connection ${row.conid} ${types[row.type]} ${row.bind_host}`);
 
         if (row.type === ConnectionDict.TYPE_INCOMING) {
+            // Incoming connections that never authenticated are stale — the client
+            // disconnected before completing registration and the state was never
+            // cleaned up (typically because the worker crashed). Purge them now.
+            if (!row.auth_user_id) {
+                await app.db.dbConnections('connections').where('conid', row.conid).delete();
+                continue;
+            }
             await app.cons.loadFromId(row.conid, row.type);
         } else if (row.type === ConnectionDict.TYPE_OUTGOING) {
             let con = await app.cons.loadFromId(row.conid, row.type);
