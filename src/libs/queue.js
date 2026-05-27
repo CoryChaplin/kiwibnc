@@ -227,6 +227,17 @@ module.exports = class Queue extends EventEmitter {
                     return;
                 }
 
+                // Without this handler, an unexpected TCP close emits an unhandled
+                // 'error' event on conn and crashes the Node.js process.
+                conn.on('error', (connErr) => {
+                    l.warn('AMQP connection error:', connErr.message);
+                    this.channel = null;
+                });
+                conn.on('close', () => {
+                    l.warn('AMQP connection closed');
+                    this.channel = null;
+                });
+
                 this.stats.increment('connecting.success');
                 this.stats.increment('connecting.time');
                 conn.createChannel((err, channel) => {
