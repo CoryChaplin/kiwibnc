@@ -602,6 +602,29 @@ class SqliteMessageStore {
         return messages;
     }
 
+    getNthLatestMessageTime(userId, networkId, buffer, n) {
+        let stmt = this.db.prepare(`
+            SELECT time
+            FROM logs
+            WHERE
+                logs.user_id = :user_id
+                AND logs.network_id = :network_id
+                AND logs.bufferref = (SELECT id FROM data WHERE data = :buffer)
+                AND logs.type IN (:type_privmsg, :type_notice)
+            ORDER BY time DESC
+            LIMIT 1 OFFSET :offset
+        `);
+        let row = stmt.get({
+            user_id: userId,
+            network_id: networkId,
+            buffer: buffer,
+            offset: Math.max(0, n - 1),
+            type_privmsg: MSG_TYPE_PRIVMSG,
+            type_notice: MSG_TYPE_NOTICE,
+        });
+        return row ? row.time : 0;
+    }
+
     countMessagesSince(userId, networkId, buffer, fromTime) {
         let stmt = this.db.prepare(`
             SELECT COUNT(*) AS cnt

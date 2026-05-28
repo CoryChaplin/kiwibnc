@@ -81,6 +81,15 @@ class MessageStores {
         return readable.countMessagesSince(...args);
     }
 
+    getNthLatestMessageTime(...args) {
+        let readable = this.stores.find(s => s.supportsRead);
+        if (!readable || typeof readable.getNthLatestMessageTime !== 'function') {
+            return 0;
+        }
+
+        return readable.getNthLatestMessageTime(...args);
+    }
+
     get connectHistory() {
         let readable = this.stores.find(s => s.supportsRead);
         return readable ? readable.connectHistory : 50;

@@ -17,23 +17,14 @@ function safeSeenIso(val) {
     return isoTime(d);
 }
 
-function buildBufferTags(buffer, networkName, unreadCount) {
+function buildBufferTags(buffer, networkName, unreadCount, seenMs) {
     let tags = {
         network: networkName,
         buffer: buffer.name,
     };
 
-    let maxSeen = 0;
-    if (buffer.lastSeen) {
-        // Use the most recent lastSeen across all clients so that marking a buffer
-        // as read on one client is reflected on every other client for the same user.
-        for (let cid in buffer.lastSeen) {
-            let ts = Number(buffer.lastSeen[cid]);
-            if (ts > maxSeen) {
-                maxSeen = ts;
-            }
-        }
-        let seen = safeSeenIso(maxSeen);
+    if (seenMs > 0) {
+        let seen = safeSeenIso(seenMs);
         if (seen) {
             tags.seen = seen;
         }
@@ -63,10 +54,14 @@ function buildBufferTags(buffer, networkName, unreadCount) {
     return tags;
 }
 
+// Compute the seen timestamp shared between bouncer-cap clients. Keys prefixed
+// with 'auto:' are written by non-bouncer clients (every PRIVMSG received) and
+// would clobber the shared state, so they're excluded here.
 function maxSeenTs(buffer) {
     let max = 0;
     if (buffer.lastSeen) {
         for (let cid in buffer.lastSeen) {
+            if (cid.startsWith('auto:')) continue;
             let ts = Number(buffer.lastSeen[cid]);
             if (ts > max) max = ts;
         }
@@ -87,16 +82,23 @@ async function sendBufferListToClient(client, network, upstream) {
     const userId = upstream.state.authUserId;
     const networkId = upstream.state.authNetworkId;
     const hasMessageStore = bncApp.messages && typeof bncApp.messages.countMessagesSince === 'function';
+    const historyDepth = (bncApp.messages && bncApp.messages.connectHistory) || 50;
 
     for (let chanName in upstream.state.buffers) {
         let buffer = upstream.state.buffers[chanName];
+        let seen = maxSeenTs(buffer);
         let unreadCount;
         if (hasMessageStore) {
-            // seen=0 means "never read by anyone": count all stored messages so the
-            // client gets an authoritative value for buffers it has never opened.
-            unreadCount = bncApp.messages.countMessagesSince(userId, networkId, buffer.name, maxSeenTs(buffer));
+            // If no bouncer-cap client has ever read this buffer, fall back to the
+            // timestamp of the Nth most recent stored message (N = connect_history),
+            // so the initial unread count is capped at a sensible window rather than
+            // showing every message ever stored.
+            if (seen === 0) {
+                seen = bncApp.messages.getNthLatestMessageTime(userId, networkId, buffer.name, historyDepth);
+            }
+            unreadCount = bncApp.messages.countMessagesSince(userId, networkId, buffer.name, seen);
         }
-        let tags = buildBufferTags(buffer, network.name, unreadCount);
+        let tags = buildBufferTags(buffer, network.name, unreadCount, seen);
         client.writeMsg('BOUNCER', 'listbuffers', network.id, messageTags.encode(tags));
     }
 

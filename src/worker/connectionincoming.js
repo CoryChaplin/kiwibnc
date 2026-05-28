@@ -507,7 +507,9 @@ class ConnectionIncoming {
             }
 
             let day = (1000 * 60 * 60 * 24);
-            let since = buffer.lastSeen[this.state.clientid] || Date.now() - (day * 1);
+            // Use a namespaced key so non-bouncer clients' lastSeen don't clobber the
+            // shared 'bnc' / clientid keys used by bouncer-cap clients.
+            let since = buffer.lastSeen['auto:' + this.state.clientid] || Date.now() - (day * 1);
             let messages = await this.messages.getMessagesBetween(
                 this.state.authUserId,
                 this.state.authNetworkId,
@@ -586,13 +588,17 @@ class ConnectionIncoming {
             return;
         }
 
+        // Non-bouncer clients track lastSeen under a namespaced key so they don't
+        // collide with the shared lastSeen used by bouncer-cap clients (which manage
+        // it explicitly via BOUNCER CHANGEBUFFER seen=).
+        let key = 'auto:' + this.state.clientid;
         let changed = false;
         bufferNames.forEach(bufName => {
             let buf = this.upstream.state.getBuffer(bufName);
             if (buf) {
-                let current = buf.lastSeen[this.state.clientid] || 0;
+                let current = buf.lastSeen[key] || 0;
                 if (current < Date.now()) {
-                    buf.lastSeen[this.state.clientid] = Date.now();
+                    buf.lastSeen[key] = Date.now();
                     changed = true;
                 }
             }
