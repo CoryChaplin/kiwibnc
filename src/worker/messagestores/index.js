@@ -72,22 +72,22 @@ class MessageStores {
         return await readable.getMessagesBetween(...args);
     }
 
-    countMessagesSince(...args) {
+    async countMessagesSince(...args) {
         let readable = this.stores.find(s => s.supportsRead);
         if (!readable || typeof readable.countMessagesSince !== 'function') {
             return 0;
         }
 
-        return readable.countMessagesSince(...args);
+        return await readable.countMessagesSince(...args);
     }
 
-    getNthLatestMessageTime(...args) {
+    async getNthLatestMessageTime(...args) {
         let readable = this.stores.find(s => s.supportsRead);
         if (!readable || typeof readable.getNthLatestMessageTime !== 'function') {
             return 0;
         }
 
-        return readable.getNthLatestMessageTime(...args);
+        return await readable.getNthLatestMessageTime(...args);
     }
 
     get connectHistory() {

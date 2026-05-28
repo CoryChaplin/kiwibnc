@@ -603,6 +603,9 @@ class SqliteMessageStore {
     }
 
     getNthLatestMessageTime(userId, networkId, buffer, n) {
+        // OFFSET n returns the (n+1)th most recent message; combined with
+        // `time > result` in countMessagesSince this yields exactly n messages
+        // counted as unread. Using OFFSET n-1 would undercount by one.
         let stmt = this.db.prepare(`
             SELECT time
             FROM logs
@@ -618,7 +621,7 @@ class SqliteMessageStore {
             user_id: userId,
             network_id: networkId,
             buffer: buffer,
-            offset: Math.max(0, n - 1),
+            offset: Math.max(0, n),
             type_privmsg: MSG_TYPE_PRIVMSG,
             type_notice: MSG_TYPE_NOTICE,
         });

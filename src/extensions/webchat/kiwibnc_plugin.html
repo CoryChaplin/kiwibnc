@@ -840,6 +840,21 @@
         kiwi.on('network.new', (event) => {
             event.network.ircClient.requestCap('bouncer');
             autoConnectIfReady(event.network);
+
+            // On disconnect, clear sync state so the next listbuffers after
+            // reconnect is treated as an initial sync (applies server unread
+            // values even when seen hasn't advanced). Without this, counts
+            // accumulated locally would shadow authoritative server values.
+            event.network.ircClient.on('socket close', () => {
+                const netId = String(_.get(event.network, 'connection.bncnetid', ''));
+                if (!netId) return;
+                bouncerSyncState.syncedNetworks.delete(netId);
+                bouncerSyncState.pendingUnread.forEach((_, key) => {
+                    if (key.startsWith(netId + '/')) {
+                        bouncerSyncState.pendingUnread.delete(key);
+                    }
+                });
+            });
         });
 
         // Gate bufferSeen calls: block them until the initial bouncer buffer sync

@@ -94,9 +94,9 @@ async function sendBufferListToClient(client, network, upstream) {
             // so the initial unread count is capped at a sensible window rather than
             // showing every message ever stored.
             if (seen === 0) {
-                seen = bncApp.messages.getNthLatestMessageTime(userId, networkId, buffer.name, historyDepth);
+                seen = await bncApp.messages.getNthLatestMessageTime(userId, networkId, buffer.name, historyDepth);
             }
-            unreadCount = bncApp.messages.countMessagesSince(userId, networkId, buffer.name, seen);
+            unreadCount = await bncApp.messages.countMessagesSince(userId, networkId, buffer.name, seen);
         }
         let tags = buildBufferTags(buffer, network.name, unreadCount, seen);
         client.writeMsg('BOUNCER', 'listbuffers', network.id, messageTags.encode(tags));
@@ -611,7 +611,6 @@ async function sendNetworkListToClients(clients) {
         parts.push('port=' + net.port);
         parts.push('tls=' + (net.tls ? '1' : '0'));
         parts.push('tlsverify=' + (net.tlsverify ? '1' : '0'));
-        parts.push('host=' + net.host);
 
         let propsToAdd = {
             // network_property: bouncer_key
