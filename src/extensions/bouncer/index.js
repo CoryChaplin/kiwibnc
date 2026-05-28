@@ -92,10 +92,9 @@ async function sendBufferListToClient(client, network, upstream) {
         let buffer = upstream.state.buffers[chanName];
         let unreadCount;
         if (hasMessageStore) {
-            let seen = maxSeenTs(buffer);
-            unreadCount = seen > 0
-                ? bncApp.messages.countMessagesSince(userId, networkId, buffer.name, seen)
-                : undefined;
+            // seen=0 means "never read by anyone": count all stored messages so the
+            // client gets an authoritative value for buffers it has never opened.
+            unreadCount = bncApp.messages.countMessagesSince(userId, networkId, buffer.name, maxSeenTs(buffer));
         }
         let tags = buildBufferTags(buffer, network.name, unreadCount);
         client.writeMsg('BOUNCER', 'listbuffers', network.id, messageTags.encode(tags));

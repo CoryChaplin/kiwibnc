@@ -264,6 +264,7 @@
             }
 
             const key = netStateKey(network, netId);
+            const isInitialSync = !bouncerSyncState.syncedNetworks.has(netId);
             const next = new Set();
             (buffers || []).forEach((bufferInfo) => {
                 const bufferName = String(_.get(bufferInfo, 'name', ''));
@@ -290,23 +291,31 @@
                     bufferState.enabled = bufferState.joined;
                 }
 
-                if (bufferInfo.seen) {
-                    const seenTs = Date.parse(bufferInfo.seen);
-                    if (Number.isFinite(seenTs)) {
-                        bufferState.last_read = seenTs;
-                    }
-                }
+                // A propagated listbuffers carries the state of EVERY buffer, but only
+                // the one that triggered the propagation actually changed. We must avoid
+                // overwriting unread counts on unchanged buffers, otherwise we clobber
+                // counts that the client has been incrementing locally via addMessage.
+                // Heuristic: only apply server state when `seen` has actually moved forward
+                // (i.e. someone read this buffer on another device), or on the first sync
+                // after reload (when local state is empty).
+                const newSeenTs = bufferInfo.seen ? Date.parse(bufferInfo.seen) : 0;
+                const seenAdvanced = Number.isFinite(newSeenTs) && newSeenTs > (bufferState.last_read || 0);
+                const pendingKey = `${netId}/${bufferName}`;
 
-                // Apply server-computed unread count. Only override when the buffer is not
-                // currently visible (visible buffers reset their own unread to 0 on focus).
-                if (!bufferState.flag('is_visible')) {
-                    const pendingKey = `${netId}/${bufferName}`;
-                    const unread = bouncerSyncState.pendingUnread.get(pendingKey);
-                    if (unread !== undefined) {
-                        bufferState.flag('unread', unread);
-                        bouncerSyncState.pendingUnread.delete(pendingKey);
+                if (isInitialSync || seenAdvanced) {
+                    if (Number.isFinite(newSeenTs) && newSeenTs > 0) {
+                        bufferState.last_read = newSeenTs;
+                    }
+                    // Apply server-computed unread count. Skip if buffer is currently
+                    // visible (it resets its own unread to 0 on focus).
+                    if (!bufferState.flag('is_visible')) {
+                        const unread = bouncerSyncState.pendingUnread.get(pendingKey);
+                        if (unread !== undefined) {
+                            bufferState.flag('unread', unread);
+                        }
                     }
                 }
+                bouncerSyncState.pendingUnread.delete(pendingKey);
 
                 if (bufferInfo.notify && _.isFunction(bufferState.setting)) {
                     bufferState.setting('alert_on', bufferInfo.notify);
