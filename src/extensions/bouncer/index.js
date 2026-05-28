@@ -17,16 +17,16 @@ function safeSeenIso(val) {
     return isoTime(d);
 }
 
-function buildBufferTags(buffer, networkName) {
+function buildBufferTags(buffer, networkName, unreadCount) {
     let tags = {
         network: networkName,
         buffer: buffer.name,
     };
 
+    let maxSeen = 0;
     if (buffer.lastSeen) {
         // Use the most recent lastSeen across all clients so that marking a buffer
         // as read on one client is reflected on every other client for the same user.
-        let maxSeen = 0;
         for (let cid in buffer.lastSeen) {
             let ts = Number(buffer.lastSeen[cid]);
             if (ts > maxSeen) {
@@ -37,6 +37,10 @@ function buildBufferTags(buffer, networkName) {
         if (seen) {
             tags.seen = seen;
         }
+    }
+
+    if (typeof unreadCount === 'number') {
+        tags.unread = String(unreadCount);
     }
 
     if (buffer.isChannel) {
@@ -59,6 +63,17 @@ function buildBufferTags(buffer, networkName) {
     return tags;
 }
 
+function maxSeenTs(buffer) {
+    let max = 0;
+    if (buffer.lastSeen) {
+        for (let cid in buffer.lastSeen) {
+            let ts = Number(buffer.lastSeen[cid]);
+            if (ts > max) max = ts;
+        }
+    }
+    return max;
+}
+
 async function sendBufferListToClient(client, network, upstream) {
     if (!client || !clientSupportsBouncer(client)) {
         return;
@@ -69,9 +84,20 @@ async function sendBufferListToClient(client, network, upstream) {
         return;
     }
 
+    const userId = upstream.state.authUserId;
+    const networkId = upstream.state.authNetworkId;
+    const hasMessageStore = bncApp.messages && typeof bncApp.messages.countMessagesSince === 'function';
+
     for (let chanName in upstream.state.buffers) {
         let buffer = upstream.state.buffers[chanName];
-        let tags = buildBufferTags(buffer, network.name);
+        let unreadCount;
+        if (hasMessageStore) {
+            let seen = maxSeenTs(buffer);
+            unreadCount = seen > 0
+                ? bncApp.messages.countMessagesSince(userId, networkId, buffer.name, seen)
+                : undefined;
+        }
+        let tags = buildBufferTags(buffer, network.name, unreadCount);
         client.writeMsg('BOUNCER', 'listbuffers', network.id, messageTags.encode(tags));
     }
 

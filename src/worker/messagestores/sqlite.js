@@ -602,6 +602,28 @@ class SqliteMessageStore {
         return messages;
     }
 
+    countMessagesSince(userId, networkId, buffer, fromTime) {
+        let stmt = this.db.prepare(`
+            SELECT COUNT(*) AS cnt
+            FROM logs
+            WHERE
+                logs.user_id = :user_id
+                AND logs.network_id = :network_id
+                AND logs.bufferref = (SELECT id FROM data WHERE data = :buffer)
+                AND logs.time > :time
+                AND logs.type IN (:type_privmsg, :type_notice)
+        `);
+        let row = stmt.get({
+            user_id: userId,
+            network_id: networkId,
+            buffer: buffer,
+            time: fromTime,
+            type_privmsg: MSG_TYPE_PRIVMSG,
+            type_notice: MSG_TYPE_NOTICE,
+        });
+        return row ? row.cnt : 0;
+    }
+
     async storeMessageLoop() {
         this.stats.gauge('messagestore.queue_length', this.storeQueue.length);
 

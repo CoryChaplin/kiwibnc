@@ -72,6 +72,15 @@ class MessageStores {
         return await readable.getMessagesBetween(...args);
     }
 
+    countMessagesSince(...args) {
+        let readable = this.stores.find(s => s.supportsRead);
+        if (!readable || typeof readable.countMessagesSince !== 'function') {
+            return 0;
+        }
+
+        return readable.countMessagesSince(...args);
+    }
+
     get connectHistory() {
         let readable = this.stores.find(s => s.supportsRead);
         return readable ? readable.connectHistory : 50;
