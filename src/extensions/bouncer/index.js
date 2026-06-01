@@ -168,10 +168,34 @@ module.exports.init = async function init(hooks, app) {
             return;
         }
 
+        let upstream = event.upstream;
+        let buffer = event.buffer;
+
+        // A PM buffer recreated by an incoming message (e.g. after the client
+        // closed it via DELBUFFER) starts again with an empty lastSeen. Without
+        // an anchor, the unread fallback in sendBufferListToClient would count
+        // the whole backlog. Anchor the seen timestamp to the message that
+        // preceded the one that just arrived, so only newly received messages
+        // count as unread.
+        if (bncApp.messages &&
+            typeof bncApp.messages.getNthLatestMessageTime === 'function' &&
+            maxSeenTs(buffer) === 0
+        ) {
+            let anchor = await bncApp.messages.getNthLatestMessageTime(
+                upstream.authUserId, upstream.authNetworkId, buffer.name, 1
+            );
+            if (anchor > 0) {
+                buffer.lastSeen['anchor'] = anchor;
+                if (typeof upstream.markDirty === 'function') {
+                    upstream.markDirty();
+                }
+            }
+        }
+
         // Sync to all clients of this user
         await sendBufferListToUsersClients(
-            event.upstream.authUserId,
-            event.upstream.authNetworkId,
+            upstream.authUserId,
+            upstream.authNetworkId,
             '' // No exclusion - all clients should see the new PM
         );
     });
