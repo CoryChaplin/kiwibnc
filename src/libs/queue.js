@@ -14,25 +14,134 @@ module.exports = class Queue extends EventEmitter {
         this.channel = null;
         this.consumerTag = '';
         this.closing = false;
+        this.reconnecting = false;
+        // Re-registers the consumer on a fresh channel after a reconnect.
+        // Set by listenForEvents(); null on send-only instances.
+        this._startConsuming = null;
+        // The channel the consumer is currently bound to, so we re-arm exactly
+        // once per channel (see ensureConsuming()).
+        this._consumingOn = null;
+        // Serialises concurrent connect() attempts (see connect()).
+        this._connectPromise = null;
         this.closingWg = new WaitGroup();
         this.stats = Stats.instance().makePrefix('queue');
     }
 
-    async connect() {
-        let channel = await this.getChannel();
+    connect() {
+        // Serialise concurrent connect attempts so callers racing to reconnect
+        // (e.g. _send and scheduleReconnect after a drop) share a single channel
+        // instead of each creating one and orphaning the consumer.
+        if (this._connectPromise) {
+            return this._connectPromise;
+        }
+
+        this._connectPromise = (async () => {
+            try {
+                await this._doConnect();
+            } finally {
+                this._connectPromise = null;
+            }
+        })();
+
+        return this._connectPromise;
+    }
+
+    async _doConnect() {
+        let {conn, channel} = await this.getChannel();
         await channel.assertQueue(this.queueToSockets, {durable: true});
         await channel.assertQueue(this.queueToWorker, {durable: true});
         await channel.prefetch(1000);
 
-        channel.on('error', (err) => {
-            l.warn('AMQP channel error:', err.message);
-        });
-        channel.on('close', () => {
-            l.warn('AMQP channel closed, will reconnect on next send');
+        // Channel error/close and connection error/close all mean this channel
+        // is dead. Route every one of them through onLost so an unexpected drop
+        // ALWAYS reconnects, while a manual stop (this.closing, set only by
+        // stopListening()) never does.
+        let onLost = (reason) => {
+            // A late event from a connection we've already replaced must not
+            // clobber the current channel or trigger a redundant reconnect.
+            if (this.channel !== channel) {
+                return;
+            }
             this.channel = null;
-        });
+            if (this.closing) {
+                return;
+            }
+            l.warn(`AMQP ${reason}, scheduling reconnect`);
+            this.scheduleReconnect();
+        };
+
+        // The conn 'error' handler is mandatory: without it an unexpected TCP
+        // close emits an unhandled 'error' event and crashes the process.
+        conn.on('error', (err) => l.warn('AMQP connection error:', err.message));
+        conn.on('close', () => onLost('connection closed'));
+        channel.on('error', (err) => l.warn('AMQP channel error:', err.message));
+        channel.on('close', () => onLost('channel closed'));
 
         this.channel = channel;
+
+        // Re-arm consumption on the fresh channel. No-op for send-only
+        // instances and when already bound, so every reconnect path
+        // (scheduleReconnect, _send, boot) restores the consumer exactly once.
+        this.ensureConsuming();
+    }
+
+    // Binds the consumer to the current channel if it isn't already. Safe to
+    // call after any (re)connect; only acts when there's a consumer to arm.
+    ensureConsuming() {
+        if (!this._startConsuming || !this.channel) {
+            return;
+        }
+        if (this._consumingOn === this.channel) {
+            return;
+        }
+        this._consumingOn = this.channel;
+        this._startConsuming();
+    }
+
+    scheduleReconnect() {
+        if (this.closing || this.reconnecting) {
+            return;
+        }
+        this.reconnecting = true;
+
+        let attempt = 0;
+        let tryReconnect = async () => {
+            if (this.closing) {
+                this.reconnecting = false;
+                return;
+            }
+
+            attempt++;
+            try {
+                // connect() re-arms the consumer via ensureConsuming().
+                await this.connect();
+                l.info(this._startConsuming
+                    ? 'AMQP reconnected and consumer re-established'
+                    : 'AMQP reconnected');
+                this.reconnecting = false;
+            } catch (err) {
+                let delay = Math.min(30000, 1000 * Math.pow(2, attempt - 1));
+                l.warn(`AMQP reconnect attempt ${attempt} failed: ${err.message}; retrying in ${delay}ms`);
+                setTimeout(tryReconnect, delay);
+            }
+        };
+
+        tryReconnect();
+    }
+
+    safeAck(msg) {
+        // The channel can be nulled out mid-processing by an unexpected close
+        // (the await in processMsgQueue yields). Skipping the ack is safe: the
+        // broker redelivers unacked messages once the consumer is re-armed.
+        if (!this.channel) {
+            l.warn('AMQP channel unavailable, message will be redelivered');
+            return;
+        }
+        try {
+            this.channel.ack(msg);
+        } catch (err) {
+            l.warn('AMQP ack failed, message will be redelivered:', err.message);
+        }
     }
 
     async initServer() {
@@ -127,7 +236,7 @@ module.exports = class Queue extends EventEmitter {
 
             messageTmr.stop();
             qMessage.ack();
-            this.channel.ack(qMessage.item.amqpMsg);
+            this.safeAck(qMessage.item.amqpMsg);
 
             cnt++;
             if (now() - lastCnt > 5) {
@@ -145,52 +254,58 @@ module.exports = class Queue extends EventEmitter {
             });
         };
 
-        this.channel.consume(queueName, (msg) => {
-            if (this.closing) {
-                return;
-            }
-
-            // msg can be null in some cases such as a purged queue
-            if (!msg) {
-                return;
-            }
-
-            // consumerTag is the same for every message here, but keeps tabs of it for future
-            // use anyway.
-            this.consumerTag = msg.fields.consumerTag;
-
-            let id = 'msg' + ++nextMsgId;
-            l.trace('Queue received:', id, msg.content.toString());
-            let obj = JSON.parse(msg.content.toString());
-
-            // Messages are expected to be an array of 2 items: [event_name, obj_of_params]
-            if (!obj || obj.length !== 2) {
-                this.stats.increment('message.ignored');
-                this.channel.ack(msg);
-                return;
-            }
-
-            this.stats.increment('message.received');
-
-            // Don't bother emitting if we have no events for it
-            if (this.listenerCount(obj[0]) > 0) {
-                if (obj[1] && obj[1].id) {
-                    // This event is related to a connection ID
-                    let conId = obj[1].id;
-                    q.add('connection', conId, {amqpMsg: msg, event: obj});
-                } else {
-                    // An internal bnc event
-                    q.add('bnc', 'internal', {amqpMsg: msg, event: obj});
+        // Stored so scheduleReconnect() can re-register the consumer on a fresh
+        // channel after a drop. Reuses the same queue/pipeline state above.
+        this._startConsuming = () => {
+            this.channel.consume(queueName, (msg) => {
+                if (this.closing) {
+                    return;
                 }
 
-            } else {
-                this.channel.ack(msg);
-            }
+                // msg can be null in some cases such as a purged queue
+                if (!msg) {
+                    return;
+                }
 
-            process.nextTick(() => {
-                processMsgQueue();
-            });
-        }, {noAck: false, exclusive: true});
+                // consumerTag is the same for every message here, but keeps tabs of it for future
+                // use anyway.
+                this.consumerTag = msg.fields.consumerTag;
+
+                let id = 'msg' + ++nextMsgId;
+                l.trace('Queue received:', id, msg.content.toString());
+                let obj = JSON.parse(msg.content.toString());
+
+                // Messages are expected to be an array of 2 items: [event_name, obj_of_params]
+                if (!obj || obj.length !== 2) {
+                    this.stats.increment('message.ignored');
+                    this.safeAck(msg);
+                    return;
+                }
+
+                this.stats.increment('message.received');
+
+                // Don't bother emitting if we have no events for it
+                if (this.listenerCount(obj[0]) > 0) {
+                    if (obj[1] && obj[1].id) {
+                        // This event is related to a connection ID
+                        let conId = obj[1].id;
+                        q.add('connection', conId, {amqpMsg: msg, event: obj});
+                    } else {
+                        // An internal bnc event
+                        q.add('bnc', 'internal', {amqpMsg: msg, event: obj});
+                    }
+
+                } else {
+                    this.safeAck(msg);
+                }
+
+                process.nextTick(() => {
+                    processMsgQueue();
+                });
+            }, {noAck: false, exclusive: true});
+        };
+
+        this.ensureConsuming();
     }
 
     stopListening() {
@@ -205,10 +320,21 @@ module.exports = class Queue extends EventEmitter {
             }
 
             this.closingWg.add('channel.cancel');
-            this.channel.cancel(this.consumerTag, (err, ok) => {
+            if (!this.channel) {
                 this.closingWg.done('channel.cancel');
                 resolve();
-            });
+                return;
+            }
+            try {
+                this.channel.cancel(this.consumerTag, (err, ok) => {
+                    this.closingWg.done('channel.cancel');
+                    resolve();
+                });
+            } catch (err) {
+                l.warn('AMQP channel cancel failed:', err.message);
+                this.closingWg.done('channel.cancel');
+                resolve();
+            }
         })
         .then(() => this.closingWg.wait());
     }
@@ -227,17 +353,6 @@ module.exports = class Queue extends EventEmitter {
                     return;
                 }
 
-                // Without this handler, an unexpected TCP close emits an unhandled
-                // 'error' event on conn and crashes the Node.js process.
-                conn.on('error', (connErr) => {
-                    l.warn('AMQP connection error:', connErr.message);
-                    this.channel = null;
-                });
-                conn.on('close', () => {
-                    l.warn('AMQP connection closed');
-                    this.channel = null;
-                });
-
                 this.stats.increment('connecting.success');
                 this.stats.increment('connecting.time');
                 conn.createChannel((err, channel) => {
@@ -246,7 +361,9 @@ module.exports = class Queue extends EventEmitter {
                         return;
                     }
 
-                    resolve(channel);
+                    // Lifecycle handlers are attached in _doConnect, which owns
+                    // both the conn and channel and the reconnect decision.
+                    resolve({conn, channel});
                 });
             });
         });
