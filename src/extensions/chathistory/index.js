@@ -193,7 +193,13 @@ async function commandBeforeOrAfter(msg, con, messageDb) {
         }
 
     } else if (msgRef.type === 'msgid') {
-        let msgid = dateToTs(msgRef.value);
+        // Pass the msgid through verbatim. It is matched against the stored
+        // msgid column (a TEXT id), NOT a timestamp — running it through
+        // dateToTs() would turn every id into NaN -> Date.now(), so the lookup
+        // never matched and AFTER/BEFORE msgid returned zero messages. This is
+        // the path the webchat gap-fill uses on reconnect (CHATHISTORY AFTER
+        // msgid=<last held message>), so the bug left a hole in the backlog.
+        let msgid = msgRef.value;
 
         if (subCmd === 'AFTER') {
             messages = await messageDb.getMessagesFromMsgId(
