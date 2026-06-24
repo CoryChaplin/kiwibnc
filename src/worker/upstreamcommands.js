@@ -4,6 +4,32 @@ const hooks = require('./hooks');
 
 let commands = Object.create(null);
 
+// End negotiation by asking for the authoritative enabled-cap list (see the LIST
+// branch) so a lost ACK can't leave us permanently out of sync with the server.
+function endCapNegotiation(con) {
+    con.writeLine('CAP', 'LIST');
+    con.writeLine('CAP', 'END');
+}
+
+// CAP LS/LIST/ACK replies can span multiple '*'-continued lines. Stash the
+// continuations under `key`; return the full token list on the final line, or
+// null while more lines are still expected.
+async function accumulateMultiline(con, key, msg) {
+    let stored = await con.state.tempGet(key) || [];
+
+    if (mParamU(msg, 2, '') === '*') {
+        await con.state.tempSet(key, stored.concat(mParam(msg, 3, '').split(' ')));
+        return null;
+    }
+
+    let tokens = stored.concat(mParam(msg, 2, '').split(' '));
+    if (stored.length > 0) {
+        await con.state.tempSet(key, null);
+    }
+
+    return tokens;
+}
+
 module.exports.run = async function run(msg, con) {
     let hook = await hooks.emit('message_from_upstream', {client: con, message: msg});
     if (hook.prevent) {
@@ -37,23 +63,9 @@ commands['CAP'] = async function(msg, con) {
 
     // :irc.example.net CAP * LS :invite-notify ...
     if (mParamU(msg, 1, '') === 'LS') {
-        let storedCaps = await con.state.tempGet('caps_receiving') || [];
-
-        if (mParamU(msg, 2, '') === '*') {
-            // More CAPs to follow so store it and come back later
-            let offeredCaps = mParam(msg, 3, '').split(' ');
-            offeredCaps = storedCaps.concat(offeredCaps);
-
-            await con.state.tempSet('caps_receiving', offeredCaps);
+        let offeredCaps = await accumulateMultiline(con, 'caps_receiving', msg);
+        if (offeredCaps === null) {
             return false;
-        }
-
-        let offeredCaps = mParam(msg, 2, '').split(' ');
-        offeredCaps = storedCaps.concat(offeredCaps);
-
-        // Clear out any stored CAPS now that we have them all
-        if (storedCaps.length > 0) {
-            await con.state.tempSet('caps_receiving', null);
         }
 
         // Make a list of CAPs we want to REQ
@@ -71,10 +83,24 @@ commands['CAP'] = async function(msg, con) {
         });
 
         if (requestingCaps.length === 0) {
-            con.writeLine('CAP', 'END');
+            endCapNegotiation(con);
         } else {
             con.writeLine('CAP', 'REQ', requestingCaps.join(' '));
         }
+    }
+
+    // CAP * LIST :multi-prefix sasl ... — the authoritative enabled caps. Trust
+    // it over our accumulated set, which a lost ACK can leave incomplete.
+    if (mParamU(msg, 1, '') === 'LIST') {
+        let caps = await accumulateMultiline(con, 'caplist_receiving', msg);
+        if (caps === null) {
+            return false;
+        }
+
+        // Bare names so caps.has('echo-message') etc. match
+        con.state.caps = new Set(caps.map((cap) => cap.split('=')[0]).filter(Boolean));
+        con.state.markDirty();
+        return false;
     }
 
     // :irc.example.net CAP * NEW :invite-notify ...
@@ -130,24 +156,9 @@ commands['CAP'] = async function(msg, con) {
 
     // CAP * ACK :multi-prefix sasl
     if (mParamU(msg, 1, '') === 'ACK') {
-        // 'capack_receiving' just caches CAP ACK responses that go across multiple lines
-        let storedAcks = await con.state.tempGet('capack_receiving') || [];
-
-        if (mParamU(msg, 2, '') === '*') {
-            // More ACKs to follow so store it and come back later
-            let acks = mParam(msg, 3, '').split(' ');
-            acks = storedAcks.concat(acks);
-
-            await con.state.tempSet('capack_receiving', acks);
+        let acks = await accumulateMultiline(con, 'capack_receiving', msg);
+        if (acks === null) {
             return false;
-        }
-
-        let acks = mParam(msg, 2, '').split(' ');
-        acks = storedAcks.concat(acks);
-
-        if (storedAcks.length > 0) {
-            // Clear any stored acks now that we have them all
-            await con.state.tempSet('capack_receiving', null);
         }
 
         con.state.caps = new Set(acks);
@@ -160,7 +171,7 @@ commands['CAP'] = async function(msg, con) {
         if (acks.includes('sasl') && con.state.sasl.account && con.state.sasl.password) {
             con.writeLine('AUTHENTICATE PLAIN');
         } else if (!con.state.receivedMotd) {
-            con.writeLine('CAP', 'END');
+            endCapNegotiation(con);
         }
     }
 
@@ -192,7 +203,7 @@ commands['AUTHENTICATE'] = async function(msg, con) {
 // :jaguar.test 903 jilles :SASL authentication successful
 commands['903'] = async function(msg, con) {
     if (!con.state.netRegistered) {
-        con.writeLine('CAP END');
+        endCapNegotiation(con);
     }
 };
 

@@ -224,6 +224,10 @@ function listenToQueue(app) {
             con.state.netRegistered = true;
             con.state.receivedMotd = true;
             con.state.markDirty();
+
+            // Socket survived our restart so CAP was never renegotiated; re-fetch
+            // the authoritative list in case our reloaded caps are stale.
+            con.writeLine('CAP', 'LIST');
         }
     });
     app.queue.on('connection.error', async (event) => {
@@ -354,7 +358,84 @@ async function startServers(app) {
     }
 }
 
+// loadConnections() open()s every outgoing row, but they accumulate cruft:
+// orphans from deleted networks, plus duplicates and stale connected=1 flags from
+// crashes. Keep at most one row per existing network and reset connected before
+// opening anything, so dead connections aren't resurrected.
+async function reconcileOutgoingConnections(app) {
+    let netRows = await app.db.dbUsers('user_networks').select('id');
+    let validNetworkIds = new Set(netRows.map((r) => Number(r.id)));
+
+    // connected is read before the reset below so the dedup can prefer the live row.
+    let rows = await app.db.dbConnections('connections')
+        .where('type', ConnectionDict.TYPE_OUTGOING)
+        .select('conid', 'auth_user_id', 'auth_network_id', 'connected', 'net_registered', 'last_statesave');
+
+    // Group rows sharing the same user + network.
+    let groups = new Map();
+    for (const row of rows) {
+        let key = row.auth_user_id + ':' + row.auth_network_id;
+        if (!groups.has(key)) {
+            groups.set(key, []);
+        }
+        groups.get(key).push(row);
+    }
+
+    let toDelete = [];
+    for (const group of groups.values()) {
+        let networkId = Number(group[0].auth_network_id);
+
+        // Orphan: the network no longer exists in the user db. Drop every row.
+        if (!networkId || !validNetworkIds.has(networkId)) {
+            toDelete.push(...group.map((r) => r.conid));
+            continue;
+        }
+
+        // Duplicate: keep the best row, delete the rest.
+        if (group.length > 1) {
+            group.sort(compareOutgoingRows);
+            toDelete.push(...group.slice(1).map((r) => r.conid));
+        }
+    }
+
+    if (toDelete.length > 0) {
+        l.info(`Reconciling outgoing connections: removing ${toDelete.length} orphan/duplicate row(s)`);
+        // Chunk to stay well under SQLite's bound-parameter limit.
+        const CHUNK = 400;
+        for (let i = 0; i < toDelete.length; i += CHUNK) {
+            await app.db.dbConnections('connections')
+                .whereIn('conid', toDelete.slice(i, i + CHUNK))
+                .delete();
+        }
+    }
+
+    // Nothing is connected until a live socket reconfirms it on open(), so a flag
+    // stuck at 1 by a crash can't be trusted.
+    await app.db.dbConnections('connections')
+        .where('type', ConnectionDict.TYPE_OUTGOING)
+        .update({ connected: 0 });
+}
+
+// Prefer the row the live socket is keyed to. We can't query the sockets layer,
+// so connected (read before the reset) is the closest signal, then registered,
+// then most recently saved.
+function compareOutgoingRows(a, b) {
+    let byConnected = (b.connected ? 1 : 0) - (a.connected ? 1 : 0);
+    if (byConnected !== 0) {
+        return byConnected;
+    }
+
+    let byRegistered = (b.net_registered ? 1 : 0) - (a.net_registered ? 1 : 0);
+    if (byRegistered !== 0) {
+        return byRegistered;
+    }
+
+    return (b.last_statesave || 0) - (a.last_statesave || 0);
+}
+
 async function loadConnections(app) {
+    await reconcileOutgoingConnections(app);
+
     let rows = await app.db.dbConnections.raw('SELECT conid, type, bind_host, auth_user_id FROM connections');
     l.info(`Loading ${rows.length} connections`);
     let types = ['OUTGOING', 'INCOMING', 'LISTENING'];
