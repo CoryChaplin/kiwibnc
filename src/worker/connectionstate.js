@@ -57,6 +57,7 @@ class IrcBuffer {
         this.isChannel = !!isChannel;
         this.lastSeen = Object.create(null); // {clientid: timestamp}
         this.notifyLevel = Helpers.notifyLevel.Mention;
+        this.settings = Object.create(null); // client-side per-buffer settings (kiwi.settings)
         this.users = Object.create(null);
     }
 
@@ -120,6 +121,7 @@ class IrcBuffer {
         c.isChannel = !!obj.isChannel;
         c.lastSeen = obj.lastSeen || Object.create(null);
         c.notifyLevel = obj.notifyLevel || Helpers.notifyLevel.Mention;
+        c.settings = obj.settings || Object.create(null);
 
         if (obj.users) {
             for (let nick in obj.users) {

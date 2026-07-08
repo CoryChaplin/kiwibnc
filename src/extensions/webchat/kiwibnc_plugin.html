@@ -151,7 +151,22 @@
             // Pending unread counts captured from raw BOUNCER lines before the middleware
             // strips the unread= tag. Key: `${netId}/${bufferName}`, value: number.
             pendingUnread: new Map(),
+            // Pending per-buffer settings captured from raw BOUNCER lines before the
+            // middleware strips the kiwi.settings= tag. Key: `${netId}/${bufferName}`,
+            // value: parsed settings object.
+            pendingSettings: new Map(),
+            // Snapshot of the last per-buffer settings synced to the BNC, used to detect
+            // real changes and to suppress echoing settings we just received.
+            // Key: `${netId}/${bufferName}`, value: JSON string of synced settings.
+            settingsSnapshot: new Map(),
+            // Whether the buffer-settings change watcher has been installed
+            settingsWatcherAttached: false,
         };
+
+        // Per-buffer settings NOT synced through the generic kiwi.settings blob because
+        // they already have a dedicated BOUNCER channel (alert_on <-> notify) that the
+        // bouncer itself consumes for notification decisions.
+        const NON_SYNCED_BUFFER_SETTINGS = ['alert_on'];
 
         // Minimal IRC tag decoder (key=value;key=value format used in BOUNCER params).
         function decodeIrcTags(str) {
@@ -166,6 +181,58 @@
                 }
             });
             return tags;
+        }
+
+        // decodeIrcTags splits on ; and = but does not unescape values. Apply the
+        // IRCv3 message-tag value unescaping so we can JSON.parse the settings blob.
+        function unescapeTagValue(val) {
+            let s = String(val);
+            let out = '';
+            for (let i = 0; i < s.length; i++) {
+                if (s[i] === '\\' && i + 1 < s.length) {
+                    let c = s[++i];
+                    if (c === ':') out += ';';
+                    else if (c === 's') out += ' ';
+                    else if (c === 'n') out += '\n';
+                    else if (c === 'r') out += '\r';
+                    else if (c === '\\') out += '\\';
+                    else out += c;
+                } else if (s[i] !== '\\') {
+                    out += s[i];
+                }
+                // a lone trailing backslash is dropped, per spec
+            }
+            return out;
+        }
+
+        function escapeTagValue(val) {
+            return String(val)
+                .replace(/\\/g, '\\\\')
+                .replace(/;/g, '\\:')
+                .replace(/ /g, '\\s')
+                .replace(/\r/g, '\\r')
+                .replace(/\n/g, '\\n');
+        }
+
+        function isSafeSettingKey(key) {
+            return key !== '__proto__' && key !== 'constructor' && key !== 'prototype';
+        }
+
+        // The subset of a buffer's setting overrides that should be synced to the BNC
+        function syncableBufferSettings(bufferState) {
+            let out = {};
+            let settings = (bufferState && bufferState.settings) || {};
+            Object.keys(settings).forEach((key) => {
+                // undefined = an override that was cleared (falls back to global); it
+                // must not appear here, matching what JSON.stringify would drop.
+                if (settings[key] === undefined) {
+                    return;
+                }
+                if (NON_SYNCED_BUFFER_SETTINGS.indexOf(key) === -1 && isSafeSettingKey(key)) {
+                    out[key] = settings[key];
+                }
+            });
+            return out;
         }
 
         // Attach bouncer buffer listener immediately to catch early LISTBUFFERS events
@@ -187,12 +254,26 @@
                 const tagStr = params[2];
                 if (!tagStr || tagStr === 'RPL_OK' || tagStr === 'end') return;
                 const tags = decodeIrcTags(tagStr);
-                if (tags.unread === undefined) return;
                 const netId = String(params[1] || '');
                 const bufferName = String(tags.buffer || '');
                 if (!netId || !bufferName) return;
-                const unread = parseInt(tags.unread, 10);
-                bouncerSyncState.pendingUnread.set(`${netId}/${bufferName}`, isNaN(unread) ? 0 : unread);
+                const pendingKey = `${netId}/${bufferName}`;
+
+                if (tags.unread !== undefined) {
+                    const unread = parseInt(tags.unread, 10);
+                    bouncerSyncState.pendingUnread.set(pendingKey, isNaN(unread) ? 0 : unread);
+                }
+
+                if (tags['kiwi.settings'] !== undefined) {
+                    try {
+                        const parsed = JSON.parse(unescapeTagValue(tags['kiwi.settings']));
+                        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                            bouncerSyncState.pendingSettings.set(pendingKey, parsed);
+                        }
+                    } catch (err) {
+                        log.debug('kiwibnc: ignoring malformed kiwi.settings blob', err.message);
+                    }
+                }
             });
 
             kiwi.on('irc.bouncer buffers', (buffers, network) => {
@@ -319,6 +400,44 @@
 
                 if (bufferInfo.notify && _.isFunction(bufferState.setting)) {
                     bufferState.setting('alert_on', bufferInfo.notify);
+                }
+
+                // Reconcile per-buffer settings against the BNC. incomingSettings is the
+                // server's COMPLETE syncable set for this buffer ({} when it sent no
+                // kiwi.settings tag, i.e. it has none stored).
+                const settingsKey = `${netId}/${bufferName}`;
+                const incomingSettings = bouncerSyncState.pendingSettings.get(settingsKey) || {};
+                bouncerSyncState.pendingSettings.delete(settingsKey);
+
+                if (_.isFunction(bufferState.setting)) {
+                    const currentStr = JSON.stringify(syncableBufferSettings(bufferState));
+                    const snap = bouncerSyncState.settingsSnapshot.get(settingsKey);
+                    // If there's an un-pushed local change for this buffer, don't let a
+                    // (frequent) listbuffers rebroadcast clobber it before our watcher
+                    // pushes it up. The watcher will reconcile once it has been sent.
+                    const hasLocalPendingChange = snap !== undefined && snap !== currentStr;
+
+                    if (!hasLocalPendingChange) {
+                        // Unset local overrides the server no longer has (propagates
+                        // deletions). setting(key, undefined) is a no-op read, so delete
+                        // the reactive key directly (BufferState.setting falls back to the
+                        // global default once the key is gone).
+                        Object.keys(syncableBufferSettings(bufferState)).forEach((key) => {
+                            if (!Object.prototype.hasOwnProperty.call(incomingSettings, key)) {
+                                kiwi.state.$delete(bufferState.settings, key);
+                            }
+                        });
+                        // Apply the server's values
+                        Object.keys(incomingSettings).forEach((key) => {
+                            if (NON_SYNCED_BUFFER_SETTINGS.indexOf(key) === -1 && isSafeSettingKey(key)) {
+                                bufferState.setting(key, incomingSettings[key]);
+                            }
+                        });
+                        bouncerSyncState.settingsSnapshot.set(
+                            settingsKey,
+                            JSON.stringify(syncableBufferSettings(bufferState))
+                        );
+                    }
                 }
             });
 
@@ -854,6 +973,18 @@
                         bouncerSyncState.pendingUnread.delete(key);
                     }
                 });
+                bouncerSyncState.pendingSettings.forEach((_, key) => {
+                    if (key.startsWith(netId + '/')) {
+                        bouncerSyncState.pendingSettings.delete(key);
+                    }
+                });
+                // Drop snapshots for this network; the next initial sync repopulates
+                // them (and the push gate above blocks pushes until then).
+                bouncerSyncState.settingsSnapshot.forEach((_, key) => {
+                    if (key.startsWith(netId + '/')) {
+                        bouncerSyncState.settingsSnapshot.delete(key);
+                    }
+                });
             });
         });
 
@@ -908,8 +1039,86 @@
             }
         });
 
+        // Push local per-buffer setting changes to the BNC so they persist and sync
+        // across the user's other connected clients. This is the write side of the
+        // read path in handleBouncerBuffers().
+        function attachBufferSettingsWatcher() {
+            if (bouncerSyncState.settingsWatcherAttached) {
+                return;
+            }
+            if (!kiwi.state || !_.isFunction(kiwi.state.$watch)) {
+                return;
+            }
+            bouncerSyncState.settingsWatcherAttached = true;
+
+            const pushChanges = _.debounce(() => {
+                kiwi.state.networks.forEach((network) => {
+                    const netId = String(_.get(network, 'connection.bncnetid', ''));
+                    if (!netId) {
+                        return;
+                    }
+                    // Don't push until the initial buffer sync has restored the real
+                    // server-side settings, otherwise stale local state could overwrite
+                    // the BNC's stored values on startup.
+                    if (!bouncerSyncState.syncedNetworks.has(netId)) {
+                        return;
+                    }
+                    const client = network.ircClient;
+                    if (!client || !_.isFunction(client.raw)) {
+                        return;
+                    }
+
+                    network.buffers.forEach((bufferState) => {
+                        const bufferName = bufferState.name;
+                        if (!bufferName) {
+                            return;
+                        }
+                        // Only channels and queries have server-side buffers to update
+                        if (_.isFunction(bufferState.isChannel) && _.isFunction(bufferState.isQuery) &&
+                            !bufferState.isChannel() && !bufferState.isQuery()) {
+                            return;
+                        }
+
+                        const key = `${netId}/${bufferName}`;
+                        const currentStr = JSON.stringify(syncableBufferSettings(bufferState));
+
+                        if (bouncerSyncState.settingsSnapshot.get(key) === currentStr) {
+                            return;
+                        }
+
+                        const known = bouncerSyncState.settingsSnapshot.has(key);
+                        bouncerSyncState.settingsSnapshot.set(key, currentStr);
+
+                        // Nothing meaningful to push for a new buffer with no overrides
+                        if (!known && currentStr === '{}') {
+                            return;
+                        }
+
+                        client.raw(`BOUNCER changebuffer ${netId} ${bufferName} kiwi.settings=${escapeTagValue(currentStr)}`);
+                    });
+                });
+            }, 2000);
+
+            // Recompute a fingerprint of every buffer's syncable settings; the watcher
+            // fires (and debounce-pushes) only when that fingerprint actually changes.
+            kiwi.state.$watch(() => {
+                let vals = [];
+                kiwi.state.networks.forEach((network) => {
+                    const netId = _.get(network, 'connection.bncnetid', '');
+                    if (!netId) {
+                        return;
+                    }
+                    network.buffers.forEach((bufferState) => {
+                        vals.push(`${netId}/${bufferState.name}=${JSON.stringify(syncableBufferSettings(bufferState))}`);
+                    });
+                });
+                return vals.join('\n');
+            }, pushChanges);
+        }
+
         // Attach listener immediately on plugin load
         attachBouncerListener();
+        attachBufferSettingsWatcher();
     });
 </script>
 

@@ -3,6 +3,39 @@ const { mParam, mParamU, isoTime, notifyLevel } = require('../../libs/helpers');
 
 let bncApp = null;
 
+// Max size of the encoded kiwi.settings blob we'll accept/store per buffer,
+// as a guard against a client stuffing large values into buffer settings.
+const MAX_BUFFER_SETTINGS_LEN = 4096;
+
+function safeParseSettings(val) {
+    if (typeof val !== 'string' || val.length === 0 || val.length > MAX_BUFFER_SETTINGS_LEN) {
+        return null;
+    }
+
+    let parsed;
+    try {
+        parsed = JSON.parse(val);
+    } catch (err) {
+        return null;
+    }
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return null;
+    }
+
+    // Copy onto a null-proto object, skipping keys that could pollute a prototype
+    // if this object were ever assigned onto a normal object down the line.
+    let clean = Object.create(null);
+    for (let key of Object.keys(parsed)) {
+        if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+            continue;
+        }
+        clean[key] = parsed[key];
+    }
+
+    return clean;
+}
+
 function safeSeenIso(val) {
     let ts = Number(val);
     if (!Number.isFinite(ts) || ts <= 0) {
@@ -49,6 +82,10 @@ function buildBufferTags(buffer, networkName, unreadCount, seenMs) {
     });
     if (levels[buffer.notifyLevel]) {
         tags.notify = levels[buffer.notifyLevel];
+    }
+
+    if (buffer.settings && Object.keys(buffer.settings).length > 0) {
+        tags['kiwi.settings'] = JSON.stringify(buffer.settings);
     }
 
     return tags;
@@ -436,6 +473,16 @@ async function handleBouncerCommand(event) {
             });
             if (Object.keys(levels).includes(tags.notify)) {
                 buffer.notifyLevel = levels[tags.notify];
+            }
+        }
+
+        if (tags && typeof tags['kiwi.settings'] === 'string') {
+            let incoming = safeParseSettings(tags['kiwi.settings']);
+            if (incoming) {
+                // Clients always transmit their complete syncable set, so replace
+                // rather than merge. Merging would resurrect keys the user removed
+                // and let the stored object grow past MAX_BUFFER_SETTINGS_LEN.
+                buffer.settings = incoming;
             }
         }
 
