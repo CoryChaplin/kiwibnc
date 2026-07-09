@@ -52,10 +52,22 @@ module.exports.init = async function init(hooks) {
         let {client, message} = event;
         if(message.command === 'PRIVMSG' || message.command === 'NOTICE' || message.command === 'TAGMSG') {
             if (!client.state.caps.has('echo-message')
-            && client.upstream.state.nick === message.nick) {
+            && client.upstream.state.nick.toLowerCase() === (message.nick || '').toLowerCase()) {
                 event.preventDefault();
             } else if(client.state.caps.has('echo-message') && message.source === 'client') {
                 event.preventDefault(); // Client and server support echo-message and msg came from a client, so ignore it.
+            } else if (!client.state.caps.has('echo-message') && message.source !== 'client') {
+                // [nick-dup] The echo was NOT suppressed. To avoid noise from other users' traffic,
+                // only flag the suspect case: the message nick matches the nick tracked on this
+                // client connection (client.state.nick) but diverges from upstream.state.nick. That
+                // divergence between the two nick trackers is precisely what would leak a self-echo
+                // back to the sender and cause the "own messages doubled after nick change" issue.
+                let msgNick = (message.nick || '').toLowerCase();
+                let clientNick = (client.state.nick || '').toLowerCase();
+                let upstreamNick = (client.upstream.state.nick || '').toLowerCase();
+                if (msgNick && msgNick === clientNick && msgNick !== upstreamNick) {
+                    l.info(`[nick-dup] self-echo LEAKED cmd=${message.command} message.nick=${message.nick} client.state.nick=${client.state.nick} upstream.state.nick=${client.upstream.state.nick} target=${message.params && message.params[0]}`);
+                }
             }
         }
     });
