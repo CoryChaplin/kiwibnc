@@ -62,7 +62,37 @@ async function run() {
     // Now that all the connection states have been laoded, start accepting events for them
     listenToQueue(app);
 
+    // Reconcile reloaded incoming connections against the sockets layer, reaping any whose
+    // socket did not survive our restart.
+    reconcileIncomingConnections(app);
+
     return app;
+}
+
+// After a worker-only restart the sockets layer keeps client sockets alive, so loadConnections()
+// reloads every incoming connection row. But rows whose socket died while we were down never
+// receive a connection.close, so they would linger forever as zombies that still get forwarded
+// messages (inflating linkedIncomingConIds and duplicating traffic). Ask the sockets layer which
+// connections are actually alive; mark survivors connected and purge the rest. The reply is
+// handled by the 'connections.active' listener registered in listenToQueue().
+function reconcileIncomingConnections(app) {
+    let pending = app.reloadedIncomingConIds;
+    if (!pending || pending.size === 0) {
+        return;
+    }
+
+    l.info(`Reconciling ${pending.size} reloaded incoming connections against the sockets layer`);
+    app.queue.sendToSockets('connections.getactive', {});
+
+    // Fail-safe: if the sockets layer never answers (e.g. an older version without the
+    // connections.getactive handler), do not reap anything — leaving a live connection alone
+    // is safer than wrongly killing it.
+    app.reconcileIncomingTimer = setTimeout(() => {
+        if (app.reloadedIncomingConIds && app.reloadedIncomingConIds.size > 0) {
+            l.warn(`Incoming connection reconciliation timed out; leaving ${app.reloadedIncomingConIds.size} connections untouched`);
+        }
+        app.reloadedIncomingConIds = null;
+    }, 30000);
 }
 
 async function initExtensions(app) {
@@ -230,6 +260,43 @@ function listenToQueue(app) {
             con.writeLine('CAP', 'LIST');
         }
     });
+    // Reply to reconcileIncomingConnections(): the sockets layer tells us which connection ids
+    // are actually alive. Mark reloaded incoming survivors as connected and reap the zombies.
+    app.queue.on('connections.active', async (event) => {
+        let pending = app.reloadedIncomingConIds;
+        if (!pending) {
+            return;
+        }
+        if (app.reconcileIncomingTimer) {
+            clearTimeout(app.reconcileIncomingTimer);
+            app.reconcileIncomingTimer = null;
+        }
+
+        let liveIds = new Set(event.ids || []);
+        let reaped = 0;
+        for (const id of pending) {
+            let con = cons.get(id);
+            if (!con || !(con instanceof ConnectionIncoming)) {
+                continue;
+            }
+
+            if (liveIds.has(id)) {
+                // Socket survived our restart — restore the connected flag that the reload lost.
+                con.state.connected = true;
+                con.state.markDirty();
+            } else {
+                // Socket is gone. destroy() unlinks from the upstream, removes it from the
+                // connection dict and deletes its persisted row.
+                l.info(`Reaping stale incoming connection ${id} (socket not alive in sockets layer)`);
+                con.destroy();
+                reaped++;
+            }
+        }
+
+        l.info(`Incoming reconciliation done: reaped ${reaped} stale connection(s)`);
+        app.reloadedIncomingConIds = null;
+    });
+
     app.queue.on('connection.error', async (event) => {
         l.error(`Server error ${event.id} ${event.error.message}`);
     });
@@ -439,6 +506,11 @@ async function loadConnections(app) {
     let rows = await app.db.dbConnections.raw('SELECT conid, type, bind_host, auth_user_id FROM connections');
     l.info(`Loading ${rows.length} connections`);
     let types = ['OUTGOING', 'INCOMING', 'LISTENING'];
+    // Track the incoming connections we reload so we can reconcile them against the
+    // sockets layer once the queue is listening: any whose socket did not survive our
+    // restart must be reaped, otherwise they linger as zombies (connected=0,
+    // netRegistered=1) that still receive forwarded messages. See reconcileIncomingConnections().
+    app.reloadedIncomingConIds = new Set();
     for (const row of rows) {
         l.debug(`connection ${row.conid} ${types[row.type]} ${row.bind_host}`);
 
@@ -451,6 +523,7 @@ async function loadConnections(app) {
                 continue;
             }
             await app.cons.loadFromId(row.conid, row.type);
+            app.reloadedIncomingConIds.add(row.conid);
         } else if (row.type === ConnectionDict.TYPE_OUTGOING) {
             let con = await app.cons.loadFromId(row.conid, row.type);
             con.open();
