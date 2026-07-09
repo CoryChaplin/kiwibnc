@@ -447,9 +447,22 @@ commands.NICK = async function(msg, con) {
     msgIdGenerator.add(msg);
 
     // [nick-dup] Debug instrumentation for the "own messages doubled after nick change" issue.
-    // Logs the state before/after so we can see whether our own nick change is being applied.
+    // Only log nick changes that plausibly concern one of THIS upstream's own clients: either
+    // classified as us, or misclassified as someone-else while a linked client still tracks the
+    // old nick (that would be our own change being mis-detected). Filters out third-party churn.
     let isOurNick = msg.nick.toLowerCase() === con.state.nick.toLowerCase();
-    l.info(`[nick-dup] NICK received from=${msg.nick} to=${msg.params[0]} upstream.state.nick(before)=${con.state.nick} classifiedAsUs=${isOurNick} linkedClients=${con.state.linkedIncomingConIds.size}`);
+    let oldNickL = msg.nick.toLowerCase();
+    let clientTracksOldNick = false;
+    con.state.linkedIncomingConIds.forEach((conId) => {
+        let c = con.conDict.get(conId);
+        if (c && (c.state.nick || '').toLowerCase() === oldNickL) {
+            clientTracksOldNick = true;
+        }
+    });
+    let logThisNick = isOurNick || clientTracksOldNick;
+    if (logThisNick) {
+        l.info(`[nick-dup] NICK received from=${msg.nick} to=${msg.params[0]} upstream.state.nick(before)=${con.state.nick} classifiedAsUs=${isOurNick} clientTracksOldNick=${clientTracksOldNick} linkedClients=${con.state.linkedIncomingConIds.size}`);
+    }
 
     if (con.state.logging && con.state.netRegistered) {
         await con.messages.storeMessage(msg, con, null);
@@ -467,7 +480,9 @@ commands.NICK = async function(msg, con) {
         // Someone elses nick changed. Update any buffers we have to their new nick
         let buffer = con.state.getBuffer(msg.nick);
         if (!buffer) {
-            l.info(`[nick-dup] NICK treated as someone-else but no buffer for ${msg.nick}; upstream.state.nick stays ${con.state.nick}`);
+            if (logThisNick) {
+                l.info(`[nick-dup] NICK treated as someone-else but no buffer for ${msg.nick}; upstream.state.nick stays ${con.state.nick}`);
+            }
             return;
         }
 
@@ -483,7 +498,9 @@ commands.NICK = async function(msg, con) {
         con.state.markDirty();
     }
 
-    l.info(`[nick-dup] NICK done upstream.state.nick(after)=${con.state.nick}`);
+    if (logThisNick) {
+        l.info(`[nick-dup] NICK done upstream.state.nick(after)=${con.state.nick}`);
+    }
 };
 
 commands.PRIVMSG = async function(msg, con) {
