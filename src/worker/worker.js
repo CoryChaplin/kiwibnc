@@ -224,6 +224,10 @@ function listenToQueue(app) {
         let c = await app.cons.loadFromId(event.id, ConnectionDict.TYPE_INCOMING);
         c.state.host = event.host;
         c.state.port = event.port;
+        // The socket is live the moment the sockets layer accepts it. Track it so /internals and
+        // any liveness checks reflect reality (the flag was previously never set for incoming
+        // connections, leaving them all showing connected=0).
+        c.state.connected = true;
 
         try {
             await c.state.save();
