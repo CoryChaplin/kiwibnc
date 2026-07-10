@@ -62,37 +62,65 @@ async function run() {
     // Now that all the connection states have been laoded, start accepting events for them
     listenToQueue(app);
 
-    // Reconcile reloaded incoming connections against the sockets layer, reaping any whose
-    // socket did not survive our restart.
-    reconcileIncomingConnections(app);
+    // Reconcile the incoming connections we just reloaded against the sockets layer, reaping any
+    // whose socket did not survive our restart, then keep reconciling periodically to reap zombies
+    // that accumulate during normal operation (reconnections whose old socket lingered, or lost
+    // connection.close events).
+    reconcileIncomingConnections(app, app.reloadedIncomingConIds);
+    startPeriodicIncomingReconcile(app);
 
     return app;
 }
 
-// After a worker-only restart the sockets layer keeps client sockets alive, so loadConnections()
-// reloads every incoming connection row. But rows whose socket died while we were down never
-// receive a connection.close, so they would linger forever as zombies that still get forwarded
-// messages (inflating linkedIncomingConIds and duplicating traffic). Ask the sockets layer which
-// connections are actually alive; mark survivors connected and purge the rest. The reply is
-// handled by the 'connections.active' listener registered in listenToQueue().
-function reconcileIncomingConnections(app) {
-    let pending = app.reloadedIncomingConIds;
-    if (!pending || pending.size === 0) {
+// Ask the sockets layer which connections are actually alive so we can reap zombie incoming
+// connections — rows still in memory (netRegistered=1, linked to an upstream, receiving forwarded
+// messages) whose underlying socket is gone. Unlike ZNC (single process, socket close removes the
+// client synchronously), our socket lives in a separate process and its connection.close event can
+// be lost across the IPC boundary or a worker restart, orphaning the row. Rather than dedupe by
+// clientid (which would break multi-client support), we make the sockets layer authoritative for
+// liveness: only the passed connection ids are candidates; survivors get marked connected and the
+// rest are destroyed. The reply is handled by the 'connections.active' listener in listenToQueue().
+function reconcileIncomingConnections(app, conIds) {
+    if (!conIds || conIds.size === 0) {
         return;
     }
 
-    l.info(`Reconciling ${pending.size} reloaded incoming connections against the sockets layer`);
+    // One reconcile at a time — a snapshot is in flight until its reply (or the timeout) clears it.
+    if (app.pendingIncomingReconcile) {
+        return;
+    }
+    app.pendingIncomingReconcile = new Set(conIds);
     app.queue.sendToSockets('connections.getactive', {});
 
     // Fail-safe: if the sockets layer never answers (e.g. an older version without the
     // connections.getactive handler), do not reap anything — leaving a live connection alone
     // is safer than wrongly killing it.
     app.reconcileIncomingTimer = setTimeout(() => {
-        if (app.reloadedIncomingConIds && app.reloadedIncomingConIds.size > 0) {
-            l.warn(`Incoming connection reconciliation timed out; leaving ${app.reloadedIncomingConIds.size} connections untouched`);
+        if (app.pendingIncomingReconcile) {
+            l.warn(`Incoming connection reconciliation timed out; leaving ${app.pendingIncomingReconcile.size} connections unverified`);
         }
-        app.reloadedIncomingConIds = null;
+        app.pendingIncomingReconcile = null;
+        app.reconcileIncomingTimer = null;
     }, 30000);
+}
+
+function startPeriodicIncomingReconcile(app) {
+    let intervalMs = app.conf.get('connections.incoming_reconcile_interval', 5 * 60 * 1000);
+    if (!intervalMs) {
+        return;
+    }
+    setInterval(() => {
+        // Snapshot every current incoming connection; the reply reaps those the sockets layer no
+        // longer knows about. Snapshotting up front means connections that arrive after this point
+        // are never candidates for reaping in this cycle.
+        let incomingIds = new Set();
+        app.cons.map.forEach((con) => {
+            if (con instanceof ConnectionIncoming) {
+                incomingIds.add(con.id);
+            }
+        });
+        reconcileIncomingConnections(app, incomingIds);
+    }, intervalMs).unref();
 }
 
 async function initExtensions(app) {
@@ -265,9 +293,10 @@ function listenToQueue(app) {
         }
     });
     // Reply to reconcileIncomingConnections(): the sockets layer tells us which connection ids
-    // are actually alive. Mark reloaded incoming survivors as connected and reap the zombies.
+    // are actually alive. Mark the snapshot's live incoming survivors as connected and reap the
+    // zombies (those the sockets layer no longer knows about).
     app.queue.on('connections.active', async (event) => {
-        let pending = app.reloadedIncomingConIds;
+        let pending = app.pendingIncomingReconcile;
         if (!pending) {
             return;
         }
@@ -285,7 +314,7 @@ function listenToQueue(app) {
             }
 
             if (liveIds.has(id)) {
-                // Socket survived our restart — restore the connected flag that the reload lost.
+                // Socket is alive — keep the connected flag in sync (a reload loses it).
                 con.state.connected = true;
                 con.state.markDirty();
             } else {
@@ -297,8 +326,10 @@ function listenToQueue(app) {
             }
         }
 
-        l.info(`Incoming reconciliation done: reaped ${reaped} stale connection(s)`);
-        app.reloadedIncomingConIds = null;
+        if (reaped > 0) {
+            l.info(`Incoming reconciliation reaped ${reaped} stale connection(s)`);
+        }
+        app.pendingIncomingReconcile = null;
     });
 
     app.queue.on('connection.error', async (event) => {
