@@ -101,7 +101,7 @@ function reconcileIncomingConnections(app, conIds) {
         }
         app.pendingIncomingReconcile = null;
         app.reconcileIncomingTimer = null;
-    }, 30000);
+    }, 30000).unref();
 }
 
 function startPeriodicIncomingReconcile(app) {

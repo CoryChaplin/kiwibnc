@@ -52,7 +52,7 @@ module.exports.init = async function init(hooks) {
         let {client, message} = event;
         if(message.command === 'PRIVMSG' || message.command === 'NOTICE' || message.command === 'TAGMSG') {
             if (!client.state.caps.has('echo-message')
-            && client.upstream.state.nick.toLowerCase() === (message.nick || '').toLowerCase()) {
+            && (client.upstream.state.nick || '').toLowerCase() === (message.nick || '').toLowerCase()) {
                 event.preventDefault();
             } else if(client.state.caps.has('echo-message') && message.source === 'client') {
                 event.preventDefault(); // Client and server support echo-message and msg came from a client, so ignore it.
