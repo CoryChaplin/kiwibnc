@@ -60,6 +60,20 @@ class SqliteMessageStore {
         )`);
         this.db.exec(`CREATE INDEX IF NOT EXISTS logs_user_id_ts ON logs (user_id, bufferref, time)`);
         this.db.exec(`CREATE INDEX IF NOT EXISTS logs_msgid ON logs (msgid)`);
+        /*
+         * Retention cleanup searches globally by timestamp.
+         *
+         * The existing logs_user_id_ts index starts with user_id, so it cannot
+         * efficiently serve queries that only filter with:
+         *
+         *     WHERE time < ?
+         *
+         * This index lets SQLite seek directly by message timestamp.
+         */
+        this.db.exec(`
+            CREATE INDEX IF NOT EXISTS logs_time
+            ON logs (time)
+        `);
 
         // Indexes required for efficient data cleanup (avoid full table scans)
         this.db.exec(`CREATE INDEX IF NOT EXISTS logs_bufferref ON logs (bufferref)`);
