@@ -1,5 +1,9 @@
 const sqlite3 = require('better-sqlite3');
 
+function profile(label, startedAt) {
+    l.info(`${label}: ${Date.now() - startedAt} ms`);
+}
+
 /**
  * Runs the KiwiBNC SQLite message retention cleanup in a standalone
  * process so synchronous database queries cannot block IRC keepalives,
@@ -73,7 +77,11 @@ module.exports = async function cleanupMessages() {
     let db = null;
 
     try {
+        const dbOpenStarted = Date.now();
+
         db = new sqlite3(databasePath);
+
+        profile('Opening database', dbOpenStarted);
 
         /*
          * Match the SQLite configuration used by Cory's message store.
@@ -200,18 +208,24 @@ async function processRetention(options) {
      * reliable LIKE matching when classifying channel and PM buffers.
      */
     const bufferSelectionSql = isChannel
-        ? `
-            SELECT id
-            FROM data
-            WHERE CAST(data AS TEXT) LIKE '#%'
-               OR CAST(data AS TEXT) LIKE '&%'
-        `
-        : `
-            SELECT id
-            FROM data
-            WHERE CAST(data AS TEXT) NOT LIKE '#%'
-              AND CAST(data AS TEXT) NOT LIKE '&%'
-        `;
+    ? `
+        SELECT DISTINCT logs.bufferref AS id
+        FROM logs
+        INNER JOIN data
+            ON data.id = logs.bufferref
+        WHERE CAST(data.data AS TEXT) LIKE '#%'
+           OR CAST(data.data AS TEXT) LIKE '&%'
+    `
+    : `
+        SELECT DISTINCT logs.bufferref AS id
+        FROM logs
+        INNER JOIN data
+            ON data.id = logs.bufferref
+        WHERE CAST(data.data AS TEXT) NOT LIKE '#%'
+          AND CAST(data.data AS TEXT) NOT LIKE '&%'
+    `;
+
+    const tempTableStarted = Date.now();
 
     db.exec(`DROP TABLE IF EXISTS ${tempTable}`);
 
@@ -225,6 +239,11 @@ async function processRetention(options) {
         CREATE INDEX ${tempIndex}
         ON ${tempTable} (id)
     `);
+
+    profile(
+        `Create temp table (${label})`,
+        tempTableStarted
+    );
 
     const deleteBatch = db.prepare(`
         DELETE FROM logs
@@ -261,12 +280,19 @@ async function processRetention(options) {
                 );
             }
 
+            const batchStarted = Date.now();
+
             const deleted = await runDeleteBatchWithRetry({
                 db,
                 statement: deleteBatch,
                 cutoffTime,
                 batchSize: currentBatchSize,
             });
+
+            profile(
+                `${label} batch (${deleted} rows)`,
+                batchStarted
+            );
 
             state.totalDeleted += deleted;
 
