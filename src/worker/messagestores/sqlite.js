@@ -60,7 +60,7 @@ class SqliteMessageStore {
         )`);
         this.db.exec(`CREATE INDEX IF NOT EXISTS logs_user_id_ts ON logs (user_id, bufferref, time)`);
         this.db.exec(`CREATE INDEX IF NOT EXISTS logs_msgid ON logs (msgid)`);
-        
+
         // Indexes required for efficient data cleanup (avoid full table scans)
         this.db.exec(`CREATE INDEX IF NOT EXISTS logs_bufferref ON logs (bufferref)`);
         this.db.exec(`CREATE INDEX IF NOT EXISTS logs_msgtagsref ON logs (msgtagsref)`);
@@ -91,133 +91,6 @@ class SqliteMessageStore {
         `);
         this.stmtGetExistingDataId = this.db.prepare("SELECT id FROM data WHERE data = ?");
 
-        if (this.retentionDaysChannels > 0 || this.retentionDaysPMs > 0) {
-            const runCleanupTask = async () => {
-                if (this.cleanupRunning) return;
-                this.cleanupRunning = true;
-                l.info('Running message retention cleanup');
-                let startTime = Date.now();
-                let totalDeleted = 0;
-                this.stats.increment('retention.cleanup.runs');
-
-                try {
-                    // Reduced batch size to ensure we don't hit SQLite variable limits in runDataCleanup
-                    // 150 rows * 5 columns = 750 variables (limit is 999)
-                    const BATCH_SIZE = 150;
-                    // Collect orphaned data IDs across batches and clean up at the end
-                    // to avoid running expensive NOT EXISTS queries after every small batch
-                    let allDeletedRows = [];
-
-                    const processRetention = async (days, isChannel) => {
-                        if (days <= 0) return;
-                        let more = true;
-                        let busyRetries = 0;
-
-                        // Pre-compute the set of matching buffer IDs ONCE into a temp table.
-                        //
-                        // Without this, runRetentionCleanup's IN-subquery runs a full table scan
-                        // of the 'data' table on every batch call. The 'data' column has BLOB
-                        // affinity, so SQLite cannot use the UNIQUE index for LIKE comparisons
-                        // (LIKE index optimisation only applies to TEXT affinity columns). On a
-                        // large database the scan takes several seconds and blocks the event loop
-                        // for the entire duration, stalling HTTP requests and IRC keepalives.
-                        const tempBufs = isChannel ? 'tmp_ret_ch_bufs' : 'tmp_ret_pm_bufs';
-                        this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
-                        const bufSql = isChannel
-                            ? `CREATE TEMP TABLE ${tempBufs} AS SELECT id FROM data WHERE CAST(data AS TEXT) LIKE '#%' OR CAST(data AS TEXT) LIKE '&%'`
-                            : `CREATE TEMP TABLE ${tempBufs} AS SELECT id FROM data WHERE CAST(data AS TEXT) NOT LIKE '#%' AND CAST(data AS TEXT) NOT LIKE '&%'`;
-                        this.db.exec(bufSql);
-                        this.db.exec(`CREATE INDEX idx_${tempBufs} ON ${tempBufs}(id)`);
-
-                        while (more) {
-                            // If a transaction is currently open (e.g. from storeMessageLoop), wait
-                            // until it completes to avoid nested transactions or locking issues.
-                            if (this.db.inTransaction) {
-                                if (busyRetries++ > 50) { // Wait max 5 seconds
-                                    l.warn('Database busy with other transactions, aborting retention cleanup');
-                                    this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
-                                    return;
-                                }
-                                await new Promise(resolve => setTimeout(resolve, 100));
-                                continue;
-                            }
-                            busyRetries = 0;
-
-                            let rows = [];
-                            // Transaction for the delete batch — retry on SQLITE_BUSY
-                            let retentionRetries = 0;
-                            while (true) {
-                                try {
-                                    this.db.transaction(() => {
-                                        rows = this.runRetentionCleanup(days, isChannel, BATCH_SIZE, tempBufs);
-                                    })();
-                                    break;
-                                } catch (err) {
-                                    if (err.code === 'SQLITE_BUSY' && retentionRetries++ < 10) {
-                                        await new Promise(resolve => setTimeout(resolve, 200));
-                                        continue;
-                                    }
-                                    throw err;
-                                }
-                            }
-
-                            if (rows.length > 0) {
-                                allDeletedRows.push(...rows);
-                                totalDeleted += rows.length;
-                                // Yield to event loop between batches so TCP keepalives,
-                                // reconnections and other I/O can be processed.
-                                // Without this delay, continuous synchronous SQLite writes
-                                // starve the event loop and cause IRC connection timeouts.
-                                await new Promise(resolve => setTimeout(resolve, 50));
-                            }
-
-                            if (rows.length < BATCH_SIZE) {
-                                more = false;
-                            }
-                        }
-
-                        this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
-                    };
-
-                    if (this.retentionDaysChannels > 0) {
-                        await processRetention(this.retentionDaysChannels, true);
-                    }
-                    if (this.retentionDaysPMs > 0) {
-                        await processRetention(this.retentionDaysPMs, false);
-                    }
-
-                    // Run orphaned data cleanup once at the end instead of per-batch.
-                    // runDataCleanup uses synchronous NOT EXISTS queries that block the
-                    // event loop; doing it once reduces that blocking significantly.
-                    if (allDeletedRows.length > 0) {
-                        // Process in chunks to keep each synchronous block short
-                        const DATA_CLEANUP_CHUNK = 500;
-                        for (let i = 0; i < allDeletedRows.length; i += DATA_CLEANUP_CHUNK) {
-                            let chunk = allDeletedRows.slice(i, i + DATA_CLEANUP_CHUNK);
-                            try {
-                                this.runDataCleanup(chunk);
-                            } catch (cleanupErr) {
-                                l.warn('Data cleanup failed, will retry next cycle', cleanupErr.message);
-                            }
-                            // Yield between chunks
-                            await new Promise(resolve => setTimeout(resolve, 50));
-                        }
-                    }
-
-                    this.stats.gauge('retention.cleanup.rows_deleted', totalDeleted);
-                    this.stats.gauge('retention.cleanup.duration_ms', Date.now() - startTime);
-                } catch (err) {
-                    l.error('Error running retention cleanup', err);
-                    this.stats.increment('retention.cleanup.errors');
-                } finally {
-                    this.cleanupRunning = false;
-                }
-            };
-
-            runCleanupTask();
-            // Run cleanup periodically
-            setInterval(runCleanupTask, this.retentionCleanupInterval * 60 * 1000);
-        }
     }
 
     /**
@@ -229,7 +102,7 @@ class SqliteMessageStore {
 
         this.db.transaction(() => {
             l.info('Running orphaned data cleanup (incremental)');
-            
+
             // Extract all unique IDs from the deleted rows
             const candidateIds = new Set();
             for (const row of deletedRows) {
