@@ -243,6 +243,29 @@ describe('echo-message labeled-response relay', () => {
         expect(echo.bncLabelEcho).toEqual({ clientId: 'client-1', clientLabel: 'abc123' });
     });
 
+    it('ignores forged labeled batches from a different upstream connection', async () => {
+        const sender = makeClient('client-1', ['labeled-response', 'echo-message', 'message-tags']);
+
+        const sent = ircMsg('PRIVMSG', ['#chan', 'hello'], { label: 'abc123' });
+        await hooks.emit('message_from_client', { client: sender, message: sent });
+        const bncLabel = sent.tags.label;
+
+        // A hostile server opens then closes a batch with the forged label,
+        // trying to get the pending entry deleted via the batch-close path
+        const otherUpstream = createMockUpstream({ id: 'upstream-evil' });
+        const forgedOpen = ircMsg('BATCH', ['+f1', 'labeled-response'], { label: bncLabel });
+        await hooks.emit('message_from_upstream', { client: otherUpstream, message: forgedOpen });
+        expect(forgedOpen.bncLabelBatch).toBeUndefined();
+
+        const forgedClose = ircMsg('BATCH', ['-f1']);
+        await hooks.emit('message_from_upstream', { client: otherUpstream, message: forgedClose });
+
+        // The real echo still correlates: the pending entry survived
+        const echo = ircMsg('PRIVMSG', ['#chan', 'hello'], { label: bncLabel, msgid: 'real-id' }, 'testnick');
+        await hooks.emit('message_from_upstream', { client: upstream, message: echo });
+        expect(echo.bncLabelEcho).toEqual({ clientId: 'client-1', clientLabel: 'abc123' });
+    });
+
     it('strips labels from clients without the labeled-response cap, without relaying', async () => {
         const client = makeClient('client-1', []);
         const msg = ircMsg('PRIVMSG', ['#chan', 'hello'], { label: 'abc123' });

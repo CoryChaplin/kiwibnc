@@ -190,6 +190,13 @@ module.exports.init = async function init(hooks) {
             let ref = msg.params[0] || '';
             let batchKey = upstream.id + ' ' + ref.substring(1);
             if (ref[0] === '+' && isBncLabel(msg.tags['label'])) {
+                // Only accept labels this upstream actually owns, so a hostile
+                // server can't open (then close) a batch with a forged label and
+                // destroy another connection's pending entry
+                let pending = pendingLabels.get(msg.tags['label']);
+                if (!pending || pending.upstreamId !== upstream.id) {
+                    return;
+                }
                 openLabelBatches.set(batchKey, {label: msg.tags['label'], added: Date.now()});
                 delete msg.tags['label'];
                 // Never forward our internal batch wrappers to clients
