@@ -306,7 +306,7 @@ module.exports.init = async function init(hooks) {
         }
         if(MESSAGE_COMMANDS.includes((message.command || '').toUpperCase())) {
             if (!client.state.caps.has('echo-message')
-            && client.upstream.state.nick === message.nick) {
+            && (client.upstream.state.nick || '').toLowerCase() === (message.nick || '').toLowerCase()) {
                 event.preventDefault();
             } else if(client.state.caps.has('echo-message') && message.source === 'client') {
                 event.preventDefault(); // Client and server support echo-message and msg came from a client, so ignore it.
