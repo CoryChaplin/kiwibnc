@@ -260,8 +260,11 @@ commands.USER = async function(msg, con) {
 commands.NOTICE = async function(msg, con) {
     let msgId = msgIdGenerator.generateId();
 
-    // Send this message to other connected clients
-    con.upstream && con.upstream.forEachClient((client) => {
+    // Send this message to other connected clients. Skipped when the labeled echo
+    // relay is active (msg.bncLabelRelayed): the upstream echo carries the real
+    // msgid and gets distributed to every client, so a BNC-generated copy here
+    // would only diverge from stored history.
+    !msg.bncLabelRelayed && con.upstream && con.upstream.forEachClient((client) => {
         let m = new Message('NOTICE', msg.params[0], msg.params[1]);
         m.prefix = con.upstream.state.nick;
         m.tags.msgid = msgId;
@@ -291,8 +294,11 @@ commands.NOTICE = async function(msg, con) {
 commands.PRIVMSG = async function(msg, con) {
     let msgId = msgIdGenerator.generateId();
 
-    // Send this message to other connected clients
-    con.upstream && con.upstream.forEachClient((client) => {
+    // Send this message to other connected clients. Skipped when the labeled echo
+    // relay is active (msg.bncLabelRelayed): the upstream echo carries the real
+    // msgid and gets distributed to every client, so a BNC-generated copy here
+    // would only diverge from stored history.
+    !msg.bncLabelRelayed && con.upstream && con.upstream.forEachClient((client) => {
         let m = new Message('PRIVMSG', msg.params[0], msg.params[1]);
         m.prefix = con.upstream.state.nick;
         m.tags.msgid = msgId;
