@@ -39,6 +39,7 @@ describe('echo-message labeled-response relay', () => {
         upstream = createMockUpstream({
             caps: ['echo-message', 'labeled-response', 'message-tags'],
         });
+        upstream.state.connected = true;
         upstream.forEachClient = jest.fn();
     });
 
@@ -170,6 +171,76 @@ describe('echo-message labeled-response relay', () => {
         expect(msg.bncLabelRelayed).toBeUndefined();
         expect(client.writeMsg).toHaveBeenCalledTimes(1);
         expect(client.writeMsg.mock.calls[0][0].command).toBe('ACK');
+    });
+
+    it('ACKs when upstream lacks message-tags (labels would be wiped by write())', async () => {
+        upstream.state.caps = new Set(['echo-message', 'labeled-response']);
+        const client = makeClient('client-1', ['labeled-response']);
+        const msg = ircMsg('PRIVMSG', ['#chan', 'hello'], { label: 'abc123' });
+
+        await hooks.emit('message_from_client', { client, message: msg });
+
+        expect(msg.tags.label).toBeUndefined();
+        expect(msg.bncLabelRelayed).toBeUndefined();
+        expect(client.writeMsg).toHaveBeenCalledTimes(1);
+        expect(client.writeMsg.mock.calls[0][0].command).toBe('ACK');
+    });
+
+    it('ACKs labeled commands when there is no upstream', async () => {
+        const client = createMockClient('client-1', ['labeled-response'], { upstream: null });
+        const msg = ircMsg('PRIVMSG', ['*bnc', 'hello'], { label: 'abc123' });
+
+        await hooks.emit('message_from_client', { client, message: msg });
+
+        expect(msg.tags.label).toBeUndefined();
+        expect(client.writeMsg).toHaveBeenCalledTimes(1);
+        const ack = client.writeMsg.mock.calls[0][0];
+        expect(ack.command).toBe('ACK');
+        expect(ack.tags.label).toBe('abc123');
+    });
+
+    it('ACKs labeled messages targeting *bnc instead of relaying them', async () => {
+        const client = makeClient('client-1', ['labeled-response']);
+        const msg = ircMsg('PRIVMSG', ['*bnc', 'help'], { label: 'abc123' });
+
+        await hooks.emit('message_from_client', { client, message: msg });
+
+        expect(msg.tags.label).toBeUndefined();
+        expect(msg.bncLabelRelayed).toBeUndefined();
+        expect(client.writeMsg).toHaveBeenCalledTimes(1);
+        expect(client.writeMsg.mock.calls[0][0].command).toBe('ACK');
+    });
+
+    it('leaves the label unanswered when the upstream is disconnected', async () => {
+        upstream.state.connected = false;
+        const client = makeClient('client-1', ['labeled-response']);
+        const msg = ircMsg('PRIVMSG', ['#chan', 'hello'], { label: 'abc123' });
+
+        await hooks.emit('message_from_client', { client, message: msg });
+
+        // No relay and no ACK: the client's own timeout marks the message unsent
+        expect(msg.tags.label).toBeUndefined();
+        expect(msg.bncLabelRelayed).toBeUndefined();
+        expect(client.writeMsg).not.toHaveBeenCalled();
+    });
+
+    it('ignores labels echoed by a different upstream connection', async () => {
+        const sender = makeClient('client-1', ['labeled-response', 'echo-message', 'message-tags']);
+
+        const sent = ircMsg('PRIVMSG', ['#chan', 'hello'], { label: 'abc123' });
+        await hooks.emit('message_from_client', { client: sender, message: sent });
+        const bncLabel = sent.tags.label;
+
+        // A hostile server on another user's network forges the label
+        const otherUpstream = createMockUpstream({ id: 'upstream-evil' });
+        const forged = ircMsg('PRIVMSG', ['#chan', 'gotcha'], { label: bncLabel, msgid: 'fake' }, 'testnick');
+        await hooks.emit('message_from_upstream', { client: otherUpstream, message: forged });
+        expect(forged.bncLabelEcho).toBeUndefined();
+
+        // The real echo still correlates: the pending entry was not consumed
+        const echo = ircMsg('PRIVMSG', ['#chan', 'hello'], { label: bncLabel, msgid: 'real-id' }, 'testnick');
+        await hooks.emit('message_from_upstream', { client: upstream, message: echo });
+        expect(echo.bncLabelEcho).toEqual({ clientId: 'client-1', clientLabel: 'abc123' });
     });
 
     it('strips labels from clients without the labeled-response cap, without relaying', async () => {

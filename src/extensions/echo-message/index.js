@@ -14,9 +14,9 @@ const LABEL_PREFIX = 'kbnc-';
 const LABEL_TTL = 60 * 1000;
 let labelCounter = 0;
 
-// bncLabel -> {clientId, clientLabel, added}
+// bncLabel -> {clientId, clientLabel, upstreamId, added}
 let pendingLabels = new Map();
-// `${upstreamConId} ${batchId}` -> bncLabel, for labeled responses wrapped in a BATCH
+// `${upstreamConId} ${batchId}` -> {label, added}, for labeled responses wrapped in a BATCH
 let openLabelBatches = new Map();
 
 function nextBncLabel() {
@@ -35,6 +35,13 @@ function sweepPendingLabels() {
             break;
         }
         pendingLabels.delete(label);
+    }
+    // A server that dies mid-batch never sends the closing BATCH, so expire these too
+    for (let [key, entry] of openLabelBatches) {
+        if (now - entry.added < LABEL_TTL) {
+            break;
+        }
+        openLabelBatches.delete(key);
     }
 }
 
@@ -71,22 +78,37 @@ module.exports.init = async function init(hooks) {
             delete msg.tags['label'];
         }
 
-        if (!client.state.netRegistered) {
-            return;
-        }
-        let upstream = client.upstream;
-        if (!upstream) {
-            return;
-        }
-
+        let hasLabel = !!clientLabel && client.state.caps.has('labeled-response');
         let command = msg.command.toUpperCase();
         let isMessageCmd = MESSAGE_COMMANDS.includes(command);
-        let hasLabel = !!clientLabel && client.state.caps.has('labeled-response');
+        let upstream = client.upstream;
+
+        if (!client.state.netRegistered || !upstream) {
+            // Nothing to correlate; complete the label contract so the client
+            // isn't left waiting on registration-time or bnc-local commands
+            if (hasLabel) {
+                sendAck(client, clientLabel);
+            }
+            return;
+        }
 
         if (hasLabel && !isMessageCmd) {
             // Catch-all: we can't correlate upstream responses for other commands,
             // so complete the label contract with an ACK
             sendAck(client, clientLabel);
+            return;
+        }
+
+        if (isMessageCmd && hasLabel && (msg.params[0] || '') === '*bnc') {
+            // Handled by the BNC itself, never echoed by the network
+            sendAck(client, clientLabel);
+            return;
+        }
+
+        if (isMessageCmd && hasLabel && !upstream.state.connected) {
+            // The message can't reach the network so an ACK would be a lie.
+            // Leave the label unanswered; the client's own timeout marks the
+            // message as unsent, enabling its manual-resend UX.
             return;
         }
 
@@ -98,7 +120,8 @@ module.exports.init = async function init(hooks) {
                 return;
             }
 
-            if (upstream.state.caps.has('labeled-response')) {
+            if (upstream.state.caps.has('labeled-response')
+                && upstream.state.caps.has('message-tags')) {
                 // Relay the label upstream under our own namespace. The upstream echo
                 // will come back with it and gets routed in message_from_upstream below.
                 let bncLabel = nextBncLabel();
@@ -106,6 +129,7 @@ module.exports.init = async function init(hooks) {
                 pendingLabels.set(bncLabel, {
                     clientId: client.id,
                     clientLabel: clientLabel,
+                    upstreamId: upstream.id,
                     added: Date.now(),
                 });
                 sweepPendingLabels();
@@ -114,9 +138,10 @@ module.exports.init = async function init(hooks) {
                 // relayed upstream echo (carrying the real msgid) covers everyone
                 msg.bncLabelRelayed = true;
             } else {
-                // Upstream echoes but can't carry our label. The echo can't be
-                // correlated, so at least ACK the label; the client falls back to
-                // heuristic reconciliation.
+                // Upstream echoes but can't carry our label (no labeled-response,
+                // or no message-tags — write() wipes all tags in that case). The
+                // echo can't be correlated, so at least ACK the label; the client
+                // falls back to heuristic reconciliation.
                 sendAck(client, clientLabel);
             }
             return;
@@ -165,12 +190,12 @@ module.exports.init = async function init(hooks) {
             let ref = msg.params[0] || '';
             let batchKey = upstream.id + ' ' + ref.substring(1);
             if (ref[0] === '+' && isBncLabel(msg.tags['label'])) {
-                openLabelBatches.set(batchKey, msg.tags['label']);
+                openLabelBatches.set(batchKey, {label: msg.tags['label'], added: Date.now()});
                 delete msg.tags['label'];
                 // Never forward our internal batch wrappers to clients
                 msg.bncLabelBatch = true;
             } else if (ref[0] === '-' && openLabelBatches.has(batchKey)) {
-                pendingLabels.delete(openLabelBatches.get(batchKey));
+                pendingLabels.delete(openLabelBatches.get(batchKey).label);
                 openLabelBatches.delete(batchKey);
                 msg.bncLabelBatch = true;
             }
@@ -186,7 +211,7 @@ module.exports.init = async function init(hooks) {
             bncLabel = msg.tags['label'];
             delete msg.tags['label'];
         } else if (msg.tags['batch'] && openLabelBatches.has(upstream.id + ' ' + msg.tags['batch'])) {
-            bncLabel = openLabelBatches.get(upstream.id + ' ' + msg.tags['batch']);
+            bncLabel = openLabelBatches.get(upstream.id + ' ' + msg.tags['batch']).label;
             delete msg.tags['batch'];
             viaBatch = true;
         }
@@ -197,6 +222,10 @@ module.exports.init = async function init(hooks) {
 
         let entry = pendingLabels.get(bncLabel);
         if (!entry) {
+            return;
+        }
+        if (entry.upstreamId !== upstream.id) {
+            // A label forged by another user's server must not touch this entry
             return;
         }
         if (!viaBatch) {
@@ -224,7 +253,10 @@ module.exports.init = async function init(hooks) {
         }
 
         // This is the correlated response to a labeled client command; deliver it
-        // ourselves so the originating client gets its label back
+        // ourselves so the originating client gets its label back.
+        // Spec note: a multi-message labeled response should be re-wrapped in a
+        // labeled batch for the client; we instead put the label on each message.
+        // Fine for the single-message echoes this targets.
         event.preventDefault();
 
         let isMessageCmd = MESSAGE_COMMANDS.includes(msg.command.toUpperCase());
@@ -265,7 +297,7 @@ module.exports.init = async function init(hooks) {
             // Already routed by the labeled echo relay above
             return;
         }
-        if(MESSAGE_COMMANDS.includes(message.command)) {
+        if(MESSAGE_COMMANDS.includes((message.command || '').toUpperCase())) {
             if (!client.state.caps.has('echo-message')
             && client.upstream.state.nick === message.nick) {
                 event.preventDefault();
