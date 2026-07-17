@@ -626,12 +626,7 @@ class ConnectionIncoming {
             if (message.command.toUpperCase() === 'WHO') {
                 this.upstream.whoClientQueue.push(this.id);
             }
-            // Write the message object rather than the raw line so that any tag
-            // changes made by message_from_client hooks (eg. replacing a client's
-            // labeled-response label) are sent upstream. upstream.write() would
-            // re-parse + re-serialise the raw line anyway, so this is equivalent
-            // for unmodified messages.
-            this.upstream.write(message);
+            this.upstream.write(raw + '\n');
         } else {
             l.debug('No connected upstream, not forwarding client data');
         }
