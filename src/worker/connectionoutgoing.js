@@ -159,6 +159,13 @@ class ConnectionOutgoing {
                 return;
             }
 
+            // [label] diagnostic: log the exact line put on the wire to upstream
+            // when it carries a labeled-response label, to confirm whether the
+            // label actually reaches the IRCd. Remove with the other [label] logs.
+            if (msgObj.tags && msgObj.tags['label']) {
+                l.info('[label] to-upstream wire:', rawLine);
+            }
+
             let isPriority = PRIORITY_COMMANDS.has(msgObj.command.toUpperCase());
             this.queue.sendToSockets('connection.data', {
                 id: this.id,
