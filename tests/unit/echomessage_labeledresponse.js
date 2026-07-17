@@ -31,6 +31,9 @@ describe('echo-message labeled-response relay', () => {
     beforeEach(() => {
         hooks = new EventEmitter();
 
+        // The extension emits [label] diagnostic logging via the global logger
+        global.l = { info: jest.fn(), debug: jest.fn(), trace: jest.fn(), error: jest.fn() };
+
         // Clear module state (label maps, counters) between tests
         delete require.cache[require.resolve('../../src/extensions/echo-message/index')];
         const ext = require('../../src/extensions/echo-message/index');
@@ -41,6 +44,10 @@ describe('echo-message labeled-response relay', () => {
         });
         upstream.state.connected = true;
         upstream.forEachClient = jest.fn();
+    });
+
+    afterEach(() => {
+        delete global.l;
     });
 
     function makeClient(id, caps) {

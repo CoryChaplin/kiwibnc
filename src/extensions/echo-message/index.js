@@ -83,6 +83,20 @@ module.exports.init = async function init(hooks) {
         let isMessageCmd = MESSAGE_COMMANDS.includes(command);
         let upstream = client.upstream;
 
+        // [label] diagnostic: fires whenever a client attaches a label to a
+        // message command, showing the caps state that decides which branch is
+        // taken. Remove once labeled-response relay is confirmed in production.
+        if (clientLabel !== undefined && isMessageCmd) {
+            l.info('[label] from-client', 'client=' + client.id,
+                'clientLabel=' + clientLabel,
+                'clientLR=' + client.state.caps.has('labeled-response'),
+                'hasLabel=' + hasLabel,
+                'upEcho=' + !!(upstream && upstream.state.caps.has('echo-message')),
+                'upLR=' + !!(upstream && upstream.state.caps.has('labeled-response')),
+                'upMsgTags=' + !!(upstream && upstream.state.caps.has('message-tags')),
+                'upConnected=' + !!(upstream && upstream.state.connected));
+        }
+
         if (!client.state.netRegistered || !upstream) {
             // Nothing to correlate; complete the label contract so the client
             // isn't left waiting on registration-time or bnc-local commands
@@ -137,11 +151,15 @@ module.exports.init = async function init(hooks) {
                 // Tell clientcommands to skip its own fan-out to other clients; the
                 // relayed upstream echo (carrying the real msgid) covers everyone
                 msg.bncLabelRelayed = true;
+                l.info('[label] relay', clientLabel, '->', bncLabel, 'up=' + upstream.id);
             } else {
                 // Upstream echoes but can't carry our label (no labeled-response,
                 // or no message-tags — write() wipes all tags in that case). The
                 // echo can't be correlated, so at least ACK the label; the client
                 // falls back to heuristic reconciliation.
+                l.info('[label] ack-fallback (upstream cannot carry label)', clientLabel,
+                    'upLR=' + upstream.state.caps.has('labeled-response'),
+                    'upMsgTags=' + upstream.state.caps.has('message-tags'));
                 sendAck(client, clientLabel);
             }
             return;
@@ -184,6 +202,13 @@ module.exports.init = async function init(hooks) {
         let msg = event.message;
         let upstream = event.client;
         let command = msg.command.toUpperCase();
+
+        // [label] diagnostic: any upstream message that still carries a kbnc label
+        // or opens a labeled batch. If a labeled PRIVMSG was relayed but nothing
+        // logs here, InspIRCd is not returning the label (trace C false).
+        if (isBncLabel(msg.tags['label'])) {
+            l.info('[label] upstream carries label', msg.tags['label'], 'cmd=' + command);
+        }
 
         // Labeled responses may be wrapped in a BATCH carrying the label
         if (command === 'BATCH') {
@@ -229,12 +254,15 @@ module.exports.init = async function init(hooks) {
 
         let entry = pendingLabels.get(bncLabel);
         if (!entry) {
+            l.info('[label] no pending entry for', bncLabel, '(expired or already consumed?)');
             return;
         }
         if (entry.upstreamId !== upstream.id) {
             // A label forged by another user's server must not touch this entry
+            l.info('[label] upstream mismatch for', bncLabel, 'expected', entry.upstreamId, 'got', upstream.id);
             return;
         }
+        l.info('[label] correlated', bncLabel, '-> client', entry.clientId, 'origLabel', entry.clientLabel, viaBatch ? '(via batch)' : '(direct)');
         if (!viaBatch) {
             // Directly labeled = single response, we're done with this label.
             // Batched responses keep the entry until the closing BATCH
