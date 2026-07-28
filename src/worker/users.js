@@ -281,7 +281,7 @@ class Users {
             }
         }
 
-        if (!(netInf.name || '').trim()) {
+        if (!String(netInf.name || '').trim()) {
             throw new BncError('UserError', 'missing_name', 'A network must have a name');
         }
 

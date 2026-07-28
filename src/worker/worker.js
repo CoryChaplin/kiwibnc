@@ -33,6 +33,14 @@ async function run() {
     // Container for all connection instances
     app.cons = new ConnectionDict(app.db, app.userDb, app.messages, app.queue);
 
+    // A rejected promise that nobody awaited would otherwise kill the worker. As the queue
+    // redelivers whatever message was in flight, that turns a single bad message into a crash
+    // loop that hammers everybody and backs the queue up. Log it loudly and stay alive instead.
+    process.on('unhandledRejection', (reason) => {
+        let stack = (reason && reason.stack) || reason;
+        l.error(`### Unhandled rejection - this should not happen but the worker is still running. ${stack}`);
+    });
+
     app.prepareShutdown = () => prepareShutdown(app);
     process.on('SIGQUIT', () => {
         app.prepareShutdown();
@@ -481,6 +489,28 @@ async function reconcileOutgoingConnections(app) {
     await app.db.dbConnections('connections')
         .where('type', ConnectionDict.TYPE_OUTGOING)
         .update({ connected: 0 });
+
+    // Incoming rows keep pointing at their network after it's deleted. Any later
+    // makeUpstream() for them would look up a network that isn't there, so detach
+    // them and let the client re-attach to something that exists.
+    let incomingRows = await app.db.dbConnections('connections')
+        .where('type', ConnectionDict.TYPE_INCOMING)
+        .whereNot('auth_network_id', 0)
+        .select('conid', 'auth_network_id');
+
+    let orphanIncoming = incomingRows
+        .filter((r) => !validNetworkIds.has(Number(r.auth_network_id)))
+        .map((r) => r.conid);
+
+    if (orphanIncoming.length > 0) {
+        l.info(`Reconciling incoming connections: detaching ${orphanIncoming.length} row(s) from deleted networks`);
+        const CHUNK = 400;
+        for (let i = 0; i < orphanIncoming.length; i += CHUNK) {
+            await app.db.dbConnections('connections')
+                .whereIn('conid', orphanIncoming.slice(i, i + CHUNK))
+                .update({ auth_network_id: 0 });
+        }
+    }
 }
 
 // Prefer the row the live socket is keyed to. We can't query the sockets layer,

@@ -642,6 +642,15 @@ class ConnectionIncoming {
             network = await this.userDb.getNetwork(this.state.authNetworkId);
         }
 
+        // The network may have been deleted since this connection state was saved. Without this
+        // check we throw further down and, as most callers don't await us, that becomes an
+        // unhandled rejection that takes the whole worker down.
+        if (!network) {
+            l.error(`Network ${this.state.authNetworkId} no longer exists, not making an upstream connection`);
+            this.writeStatus('The network you were attached to no longer exists');
+            return null;
+        }
+
         let con = this.upstream || new ConnectionOutgoing(null, this.db, this.messages, this.queue, this.conDict);
         con.state.authUserId = network.user_id;
         con.state.setNetwork(network);
