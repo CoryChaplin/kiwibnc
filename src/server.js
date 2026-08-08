@@ -8,6 +8,7 @@ const actionAddUser = require('./actions/adduser');
 const actionListUsers = require('./actions/listusers');
 const actionUpdateDb = require('./actions/updatedb');
 const actionDeleteUser = require('./actions/deleteuser');
+const actionCleanupMessages = require('./actions/cleanupmessages');
 
 (async function() {
     // Make the args available globally
@@ -39,6 +40,11 @@ const actionDeleteUser = require('./actions/deleteuser');
         .command('updatedb')
         .description('Update the database schema to the latest')
         .action(actionUpdateDb);
+
+    commander
+        .command('cleanupmessages')
+        .description('Run SQLite message retention cleanup')
+        .action(actionCleanupMessages);
 
     commander
         .command('run', { isDefault: true })
