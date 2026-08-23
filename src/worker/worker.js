@@ -316,10 +316,15 @@ function listenToQueue(app) {
         }
 
         let con = cons.get(event.id);
-        if (con && con instanceof ConnectionOutgoing) {
-            await con.onUpstreamClosed(event.error);
-        } else if (con && con instanceof ConnectionIncoming) {
-            await con.onClientClosed(event.error);
+        try {
+            if (con && con instanceof ConnectionOutgoing) {
+                await con.onUpstreamClosed(event.error);
+            } else if (con && con instanceof ConnectionIncoming) {
+                await con.onClientClosed(event.error);
+            }
+        } catch (err) {
+            // A rejection here would otherwise vanish silently into the queue handler
+            l.error(`Error closing connection ${event.id}:`, err.stack || err.message);
         }
     });
     app.queue.on('connection.data', async (event) => {

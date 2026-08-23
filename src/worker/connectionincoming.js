@@ -92,7 +92,10 @@ class ConnectionIncoming {
         }
 
         this.conDict.delete(this.id);
-        this.state.destroy();
+        // state.destroy() is async, so a failed delete would be an unhandled rejection
+        this.state.destroy().catch((err) => {
+            l.error(`Error deleting connection state ${this.id}:`, err.message);
+        });
     }
 
     close() {
@@ -678,19 +681,24 @@ class ConnectionIncoming {
     }
 
     async onClientClosed() {
-        let upstream = this.upstream;
-        if (upstream && upstream.state.netRegistered) {
-            // If there are no other clients connected, mark this user as away
-            let otherClients = [];
-            upstream.forEachClient(c => otherClients.push(c), this);
-            if (otherClients.length === 0) {
-                upstream.writeLine('AWAY', 'away');
-                await upstream.state.tempSet('set_away', true);
+        // destroy() must run even if the awaits below reject, otherwise this connection stays
+        // in conDict and in the upstream's linkedIncomingConIds until the next worker restart
+        try {
+            let upstream = this.upstream;
+            if (upstream && upstream.state.netRegistered) {
+                // If there are no other clients connected, mark this user as away
+                let otherClients = [];
+                upstream.forEachClient(c => otherClients.push(c), this);
+                if (otherClients.length === 0) {
+                    upstream.writeLine('AWAY', 'away');
+                    await upstream.state.tempSet('set_away', true);
+                }
             }
-        }
 
-        await hooks.emit('client_disconnected', {client: this});
-        this.destroy();
+            await hooks.emit('client_disconnected', {client: this});
+        } finally {
+            this.destroy();
+        }
     }
 }
 
