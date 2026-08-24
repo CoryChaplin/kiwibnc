@@ -18,6 +18,11 @@ class SqliteMessageStore {
         this.retentionDaysChannels = loggingConf.retention_days_channels || 0;
         this.retentionDaysPMs = loggingConf.retention_days_pms || 0;
         this.retentionCleanupInterval = loggingConf.retention_cleanup_interval || 1440; // Default 24h
+        // Minutes to wait before the first cleanup pass. Running it at boot means taking the
+        // sqlite write lock exactly when every client is reconnecting and asking for history.
+        this.retentionStartupDelay = loggingConf.retention_startup_delay !== undefined
+            ? parseInt(loggingConf.retention_startup_delay, 10)
+            : 5;
         this.sqliteCacheSize = loggingConf.cache_size || 2000;  // in KB, default 2MB
         this.sqliteMmapSize = loggingConf.mmap_size || 0;       // in bytes, default disabled
         this.connectHistory = loggingConf.connect_history !== undefined
@@ -27,6 +32,8 @@ class SqliteMessageStore {
 
         this.storeQueueLooping = false;
         this.storeQueue = [];
+        this.cleanupRunning = false;
+
 
         this.dataCache = new LRU({
             max: 50 * 1000 * 1000, // very roughly 50mb cache
@@ -101,12 +108,37 @@ class SqliteMessageStore {
                 this.stats.increment('retention.cleanup.runs');
 
                 try {
-                    // Reduced batch size to ensure we don't hit SQLite variable limits in runDataCleanup
-                    // 150 rows * 5 columns = 750 variables (limit is 999)
                     const BATCH_SIZE = 150;
-                    // Collect orphaned data IDs across batches and clean up at the end
-                    // to avoid running expensive NOT EXISTS queries after every small batch
-                    let allDeletedRows = [];
+
+                    // Orphaned 'data' ids are collected in a Set and flushed as soon as there are
+                    // enough of them for a full chunk, rather than accumulating every deleted row
+                    // until the end of the run: a catch-up pass over millions of messages would
+                    // otherwise hold the whole lot in memory at once.
+                    //
+                    // Flushing mid-run stays correct because an id is only dropped from the Set
+                    // once checked, and the *last* logs row referencing it re-adds it when deleted,
+                    // so every id gets a final check after its last reference is gone.
+                    const DATA_CLEANUP_CHUNK = 900;
+                    let pendingDataIds = new Set();
+
+                    const flushDataCleanup = async (force) => {
+                        while (pendingDataIds.size >= (force ? 1 : DATA_CLEANUP_CHUNK)) {
+                            let chunk = [];
+                            for (let id of pendingDataIds) {
+                                chunk.push(id);
+                                if (chunk.length >= DATA_CLEANUP_CHUNK) break;
+                            }
+                            chunk.forEach((id) => pendingDataIds.delete(id));
+
+                            try {
+                                this.cleanupOrphanedData(chunk);
+                            } catch (cleanupErr) {
+                                l.warn('Data cleanup failed, will retry next cycle', cleanupErr.message);
+                            }
+                            // These NOT EXISTS queries are synchronous, yield between chunks
+                            await new Promise(resolve => setTimeout(resolve, 50));
+                        }
+                    };
 
                     const processRetention = async (days, isChannel) => {
                         if (days <= 0) return;
@@ -162,13 +194,20 @@ class SqliteMessageStore {
                             }
 
                             if (rows.length > 0) {
-                                allDeletedRows.push(...rows);
+                                for (let row of rows) {
+                                    if (row.bufferref) pendingDataIds.add(row.bufferref);
+                                    if (row.msgtagsref) pendingDataIds.add(row.msgtagsref);
+                                    if (row.dataref) pendingDataIds.add(row.dataref);
+                                    if (row.prefixref) pendingDataIds.add(row.prefixref);
+                                    if (row.paramsref) pendingDataIds.add(row.paramsref);
+                                }
                                 totalDeleted += rows.length;
                                 // Yield to event loop between batches so TCP keepalives,
                                 // reconnections and other I/O can be processed.
                                 // Without this delay, continuous synchronous SQLite writes
                                 // starve the event loop and cause IRC connection timeouts.
                                 await new Promise(resolve => setTimeout(resolve, 50));
+                                await flushDataCleanup(false);
                             }
 
                             if (rows.length < BATCH_SIZE) {
@@ -186,23 +225,8 @@ class SqliteMessageStore {
                         await processRetention(this.retentionDaysPMs, false);
                     }
 
-                    // Run orphaned data cleanup once at the end instead of per-batch.
-                    // runDataCleanup uses synchronous NOT EXISTS queries that block the
-                    // event loop; doing it once reduces that blocking significantly.
-                    if (allDeletedRows.length > 0) {
-                        // Process in chunks to keep each synchronous block short
-                        const DATA_CLEANUP_CHUNK = 500;
-                        for (let i = 0; i < allDeletedRows.length; i += DATA_CLEANUP_CHUNK) {
-                            let chunk = allDeletedRows.slice(i, i + DATA_CLEANUP_CHUNK);
-                            try {
-                                this.runDataCleanup(chunk);
-                            } catch (cleanupErr) {
-                                l.warn('Data cleanup failed, will retry next cycle', cleanupErr.message);
-                            }
-                            // Yield between chunks
-                            await new Promise(resolve => setTimeout(resolve, 50));
-                        }
-                    }
+                    // Anything left over from the last partial chunk
+                    await flushDataCleanup(true);
 
                     this.stats.gauge('retention.cleanup.rows_deleted', totalDeleted);
                     this.stats.gauge('retention.cleanup.duration_ms', Date.now() - startTime);
@@ -214,9 +238,14 @@ class SqliteMessageStore {
                 }
             };
 
-            runCleanupTask();
+            // Delay the first pass rather than running it during startup, when every client is
+            // reconnecting and requesting history
+            let startupTimer = setTimeout(runCleanupTask, this.retentionStartupDelay * 60 * 1000);
             // Run cleanup periodically
-            setInterval(runCleanupTask, this.retentionCleanupInterval * 60 * 1000);
+            let intervalTimer = setInterval(runCleanupTask, this.retentionCleanupInterval * 60 * 1000);
+            // Neither timer should be a reason for the process to stay alive
+            startupTimer.unref();
+            intervalTimer.unref();
         }
     }
 
@@ -227,21 +256,32 @@ class SqliteMessageStore {
     runDataCleanup(deletedRows) {
         if (!deletedRows || deletedRows.length === 0) return;
 
-        this.db.transaction(() => {
-            l.info('Running orphaned data cleanup (incremental)');
-            
-            // Extract all unique IDs from the deleted rows
-            const candidateIds = new Set();
-            for (const row of deletedRows) {
-                if (row.bufferref) candidateIds.add(row.bufferref);
-                if (row.msgtagsref) candidateIds.add(row.msgtagsref);
-                if (row.dataref) candidateIds.add(row.dataref);
-                if (row.prefixref) candidateIds.add(row.prefixref);
-                if (row.paramsref) candidateIds.add(row.paramsref);
-            }
+        // Extract all unique IDs from the deleted rows
+        const candidateIds = new Set();
+        for (const row of deletedRows) {
+            if (row.bufferref) candidateIds.add(row.bufferref);
+            if (row.msgtagsref) candidateIds.add(row.msgtagsref);
+            if (row.dataref) candidateIds.add(row.dataref);
+            if (row.prefixref) candidateIds.add(row.prefixref);
+            if (row.paramsref) candidateIds.add(row.paramsref);
+        }
 
-            if (candidateIds.size === 0) return;
-            const allIds = Array.from(candidateIds);
+        const allIds = Array.from(candidateIds);
+        const CHUNK = 900;
+        for (let i = 0; i < allIds.length; i += CHUNK) {
+            this.cleanupOrphanedData(allIds.slice(i, i + CHUNK));
+        }
+    }
+
+    /**
+     * Deletes the given 'data' rows if nothing in 'logs' references them any more
+     * @param {Array} allIds - Candidate data ids to check
+     */
+    cleanupOrphanedData(allIds) {
+        if (!allIds || allIds.length === 0) return;
+
+        this.db.transaction(() => {
+            l.debug('Running orphaned data cleanup (incremental)');
 
             const placeholders = allIds.map(() => '?').join(',');
 
@@ -262,14 +302,21 @@ class SqliteMessageStore {
                     SELECT 1 FROM logs WHERE paramsref = data.id
                     LIMIT 1
                 )
+                RETURNING data
             `);
 
-            const info = stmt.run(...allIds);
+            const deleted = stmt.all(...allIds);
 
-            if (info.changes > 0) {
-                l.info(`Orphaned data cleanup removed ${info.changes} rows`);
-                // Clear the cache to prevent reusing IDs that have just been deleted
-                this.dataCache.reset();
+            if (deleted.length > 0) {
+                l.info(`Orphaned data cleanup removed ${deleted.length} rows`);
+                // Drop just the deleted values from the cache, so we don't hand out ids that no
+                // longer exist. Cleanup now runs several times per retention pass, and resetting
+                // the whole cache each time would push every following write back to an
+                // INSERT-then-SELECT round trip.
+                for (const row of deleted) {
+                    let key = typeof row.data === 'string' ? row.data : String(row.data);
+                    this.dataCache.del(key);
+                }
             }
         })();
     }
@@ -686,6 +733,8 @@ class SqliteMessageStore {
             // We do want to log ACTIONs though
             if (!message.params[1].startsWith('\x01ACTION' )) {
                 this.storeQueueLooping = false;
+                // Nothing to store for this one, but the queue must keep draining
+                setImmediate(() => this.storeMessageLoop());
                 return;
             }
         }
@@ -707,6 +756,8 @@ class SqliteMessageStore {
 
         if (!type) {
             this.storeQueueLooping = false;
+            // Not a message type we log (JOIN, PART, ...), move on to the next queued item
+            setImmediate(() => this.storeMessageLoop());
             return;
         }
 
@@ -739,7 +790,15 @@ class SqliteMessageStore {
             })();
         } catch (err) {
             if (err.code === 'SQLITE_BUSY') {
-                l.warn('storeMessage: database busy, retrying in 100ms');
+                // args has already been shifted off the queue, put it back or the message is lost
+                args.busyRetries = (args.busyRetries || 0) + 1;
+                if (args.busyRetries <= 10) {
+                    l.warn('storeMessage: database busy, retrying in 100ms');
+                    this.storeQueue.unshift(args);
+                } else {
+                    l.error('storeMessage: database still busy after 10 retries, dropping message');
+                    this.stats.increment('store.dropped');
+                }
                 setTimeout(() => { this.storeQueueLooping = false; this.storeMessageLoop(); }, 100);
                 return;
             }
@@ -756,7 +815,11 @@ class SqliteMessageStore {
 
     async storeMessage(message, upstreamCon, clientCon) {
         this.storeQueue.push({message, upstreamCon, clientCon});
-        this.storeMessageLoop();
+        // Schedule the write rather than running it inline. storeMessageLoop() is synchronous all
+        // the way to the insert, so calling it directly runs the transaction inside the command
+        // handler, ie. before the message has been relayed to connected clients - any wait on the
+        // sqlite write lock would land straight on message delivery latency.
+        setImmediate(() => this.storeMessageLoop());
     }
 
     deleteUserMessages(userId) {

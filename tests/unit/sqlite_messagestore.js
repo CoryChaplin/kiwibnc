@@ -190,5 +190,108 @@ describe('SqliteMessageStore Retention & Cleanup', () => {
             const count = store.db.prepare('SELECT count(*) as c FROM data').get();
             expect(count.c).toBe(0);
         });
+
+        test('should chunk candidate ids beyond a single statement', () => {
+            // More ids than the 900 per statement chunk, with one still referenced
+            const ids = [];
+            for(let i=0; i<2500; i++) {
+                ids.push(insertData(`chunked-${i}`));
+            }
+            const keptId = ids[1500];
+            insertLog({ dataref: keptId });
+
+            store.runDataCleanup(ids.map(id => ({ dataref: id })));
+
+            const count = store.db.prepare('SELECT count(*) as c FROM data').get();
+            expect(count.c).toBe(1);
+            expect(store.db.prepare('SELECT * FROM data WHERE id = ?').get(keptId)).toBeDefined();
+        });
     });
+
+    describe('storeMessage queue', () => {
+        const tick = () => new Promise(resolve => setImmediate(resolve));
+
+        // Drain the store queue, one scheduled item per tick
+        const drain = async (max = 20) => {
+            for (let i = 0; i < max; i++) {
+                await tick();
+                if (!store.storeQueue.length && !store.storeQueueLooping) return;
+            }
+        };
+
+        const upstreamCon = {
+            state: { authUserId: 1, authNetworkId: 1, nick: 'me' },
+            iSupportToken: () => null,
+        };
+
+        const makeMessage = (command, params, nick) => ({
+            command,
+            params,
+            nick: nick || 'bob',
+            tags: { time: new Date().toISOString() },
+        });
+
+        const logCount = () => store.db.prepare('SELECT count(*) as c FROM logs').get().c;
+
+        test('should not write inline, so relaying is not blocked by the write lock', async () => {
+            await store.storeMessage(makeMessage('PRIVMSG', ['#chan', 'hello']), upstreamCon, null);
+
+            // The caller returns before the insert happens
+            expect(logCount()).toBe(0);
+
+            await drain();
+            expect(logCount()).toBe(1);
+        });
+
+        test('should keep draining the queue past messages it does not log', async () => {
+            // JOIN is queued by the upstream handler but never logged
+            await store.storeMessage(makeMessage('JOIN', ['#chan']), upstreamCon, null);
+            await store.storeMessage(makeMessage('PRIVMSG', ['#chan', 'hello']), upstreamCon, null);
+
+            await drain();
+
+            expect(logCount()).toBe(1);
+            expect(store.storeQueue.length).toBe(0);
+        });
+
+        test('should keep draining the queue past ignored CTCP requests', async () => {
+            await store.storeMessage(makeMessage('PRIVMSG', ['#chan', '\x01VERSION\x01']), upstreamCon, null);
+            await store.storeMessage(makeMessage('PRIVMSG', ['#chan', 'hello']), upstreamCon, null);
+
+            await drain();
+
+            expect(logCount()).toBe(1);
+            expect(store.storeQueue.length).toBe(0);
+        });
+
+        test('should requeue a message instead of dropping it when the db is busy', async () => {
+            const realTransaction = store.db.transaction.bind(store.db);
+            let failuresLeft = 1;
+            store.db.transaction = (fn) => {
+                const wrapped = realTransaction(fn);
+                return (...args) => {
+                    if (failuresLeft-- > 0) {
+                        const err = new Error('database is locked');
+                        err.code = 'SQLITE_BUSY';
+                        throw err;
+                    }
+                    return wrapped(...args);
+                };
+            };
+
+            await store.storeMessage(makeMessage('PRIVMSG', ['#chan', 'hello']), upstreamCon, null);
+            await drain();
+
+            // First attempt failed, the message must still be queued rather than lost
+            expect(logCount()).toBe(0);
+            expect(store.storeQueue.length).toBe(1);
+
+            // The retry is scheduled 100ms out
+            await new Promise(resolve => setTimeout(resolve, 200));
+            await drain();
+
+            expect(logCount()).toBe(1);
+        });
+    });
+
 });
