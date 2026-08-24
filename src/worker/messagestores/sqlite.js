@@ -1,3 +1,5 @@
+const path = require('path');
+const { Worker } = require('worker_threads');
 const sqlite3 = require('better-sqlite3');
 const LRU = require('lru-cache');
 const Stats = require('../../libs/stats');
@@ -14,7 +16,8 @@ class SqliteMessageStore {
         this.supportsRead = true;
 
         let loggingConf = config.get('logging', {});
-        this.db = new sqlite3(config.relativePath(loggingConf.database));
+        this.databasePath = config.relativePath(loggingConf.database);
+        this.db = new sqlite3(this.databasePath);
         this.retentionDaysChannels = loggingConf.retention_days_channels || 0;
         this.retentionDaysPMs = loggingConf.retention_days_pms || 0;
         this.retentionCleanupInterval = loggingConf.retention_cleanup_interval || 1440; // Default 24h
@@ -23,6 +26,23 @@ class SqliteMessageStore {
         this.retentionStartupDelay = loggingConf.retention_startup_delay !== undefined
             ? parseInt(loggingConf.retention_startup_delay, 10)
             : 5;
+        // Reclaiming disk space after retention has deleted messages. Only has any effect on a
+        // database in incremental auto_vacuum mode, see the 'vacuummessages' action.
+        this.vacuumEnabled = loggingConf.vacuum !== undefined
+            ? !!loggingConf.vacuum
+            : true;
+        this.vacuumChunkPages = loggingConf.vacuum_chunk_pages || 2000;
+        this.vacuumKeepFreePages = loggingConf.vacuum_keep_free_pages !== undefined
+            ? parseInt(loggingConf.vacuum_keep_free_pages, 10)
+            : 4000;
+        this.vacuumPauseMs = loggingConf.vacuum_pause_ms !== undefined
+            ? parseInt(loggingConf.vacuum_pause_ms, 10)
+            : 20;
+        // Cap the WAL file after each checkpoint. -1 leaves it at its high water mark forever,
+        // which is the sqlite default and the reason messages.db-wal never gets smaller.
+        this.walSizeLimit = loggingConf.wal_size_limit !== undefined
+            ? parseInt(loggingConf.wal_size_limit, 10)
+            : 32 * 1024 * 1024;
         this.sqliteCacheSize = loggingConf.cache_size || 2000;  // in KB, default 2MB
         this.sqliteMmapSize = loggingConf.mmap_size || 0;       // in bytes, default disabled
         this.connectHistory = loggingConf.connect_history !== undefined
@@ -33,7 +53,7 @@ class SqliteMessageStore {
         this.storeQueueLooping = false;
         this.storeQueue = [];
         this.cleanupRunning = false;
-
+        this.vacuumRunning = false;
 
         this.dataCache = new LRU({
             max: 50 * 1000 * 1000, // very roughly 50mb cache
@@ -51,6 +71,11 @@ class SqliteMessageStore {
         }
         this.db.pragma('temp_store = MEMORY');      // Temp tables in RAM
         this.db.pragma('busy_timeout = 100');        // Short wait for locks; retries are handled async
+        if (this.walSizeLimit >= 0) {
+            // Truncate the WAL back down to this after a checkpoint instead of leaving it at
+            // whatever size a big write burst pushed it to
+            this.db.pragma(`journal_size_limit = ${this.walSizeLimit}`);
+        }
 
         this.db.exec(`
         CREATE TABLE IF NOT EXISTS logs (
@@ -228,6 +253,9 @@ class SqliteMessageStore {
                     // Anything left over from the last partial chunk
                     await flushDataCleanup(true);
 
+                    // Deleting rows only moves pages onto the freelist, it never shrinks the file
+                    await this.runVacuum();
+
                     this.stats.gauge('retention.cleanup.rows_deleted', totalDeleted);
                     this.stats.gauge('retention.cleanup.duration_ms', Date.now() - startTime);
                 } catch (err) {
@@ -246,6 +274,98 @@ class SqliteMessageStore {
             // Neither timer should be a reason for the process to stay alive
             startupTimer.unref();
             intervalTimer.unref();
+        }
+    }
+
+    /**
+     * Hands free pages back to the filesystem, in a worker thread.
+     *
+     * Deleting messages puts their pages on sqlite's freelist, where they are reused by new
+     * messages but never returned to the OS - which is why messages.db only ever grows. Only a
+     * database in incremental auto_vacuum mode can give them back without a full offline VACUUM.
+     */
+    async runVacuum() {
+        if (!this.vacuumEnabled || this.vacuumRunning) {
+            return;
+        }
+
+        // Nothing to reclaim on a database that only exists in memory
+        if (!this.databasePath || this.databasePath.indexOf(':memory:') > -1) {
+            return;
+        }
+
+        // incremental_vacuum is a no-op unless the database was built with, or converted to,
+        // incremental auto_vacuum. Converting needs a one-off offline VACUUM.
+        let autoVacuum = this.db.pragma('auto_vacuum', { simple: true });
+        if (autoVacuum !== 2) {
+            if (!this.warnedVacuumMode) {
+                this.warnedVacuumMode = true;
+                l.info(
+                    'Message database is not in incremental auto_vacuum mode so disk space is ' +
+                    'never reclaimed. Stop the bouncer and run "kiwibnc vacuummessages" to convert it'
+                );
+            }
+            return;
+        }
+
+        let free = this.db.pragma('freelist_count', { simple: true });
+        if (free <= this.vacuumKeepFreePages) {
+            return;
+        }
+
+        this.vacuumRunning = true;
+        let startTime = Date.now();
+        this.stats.increment('retention.vacuum.runs');
+
+        try {
+            await new Promise((resolve) => {
+                let worker = new Worker(path.join(__dirname, 'vacuumworker.js'), {
+                    workerData: {
+                        file: this.databasePath,
+                        chunkPages: this.vacuumChunkPages,
+                        keepFreePages: this.vacuumKeepFreePages,
+                        pausePerChunk: this.vacuumPauseMs,
+                        // The vacuum is the one that should wait, not the messages being stored
+                        busyTimeout: 5000,
+                        walSizeLimit: this.walSizeLimit,
+                    },
+                });
+
+                let settled = false;
+                let finish = () => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    resolve();
+                };
+
+                worker.on('message', (msg) => {
+                    if (msg.ok) {
+                        let mb = (msg.pagesFreed * msg.pageSize) / (1024 * 1024);
+                        l.info(
+                            `Vacuum returned ${msg.pagesFreed} pages (${mb.toFixed(1)}MB) to disk` +
+                            (msg.walTruncated ? ', WAL truncated' : ', WAL busy and left as is')
+                        );
+                        this.stats.gauge('retention.vacuum.pages_freed', msg.pagesFreed);
+                    } else {
+                        l.warn('Vacuum failed, will retry next cycle:', msg.error);
+                        this.stats.increment('retention.vacuum.errors');
+                    }
+                });
+
+                // A failure in the thread must never take the worker process down with it
+                worker.on('error', (err) => {
+                    l.warn('Vacuum thread error, will retry next cycle:', err.message);
+                    this.stats.increment('retention.vacuum.errors');
+                    finish();
+                });
+                worker.on('exit', finish);
+            });
+
+            this.stats.gauge('retention.vacuum.duration_ms', Date.now() - startTime);
+        } finally {
+            this.vacuumRunning = false;
         }
     }
 

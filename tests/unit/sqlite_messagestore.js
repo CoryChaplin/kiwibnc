@@ -1,3 +1,6 @@
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const SqliteMessageStore = require('../../src/worker/messagestores/sqlite');
 const Stats = require('../../src/libs/stats');
 
@@ -294,4 +297,73 @@ describe('SqliteMessageStore Retention & Cleanup', () => {
         });
     });
 
+    describe('runVacuum', () => {
+        let tmpDir;
+        let fileStore;
+
+        const makeFileStore = (overrides) => {
+            tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiwibnc-vacuum-'));
+            const config = {
+                get: () => ({
+                    database: path.join(tmpDir, 'messages.db'),
+                    // No retention, so nothing schedules itself behind the test
+                    ...overrides,
+                }),
+                relativePath: (p) => p,
+            };
+            return new SqliteMessageStore(config);
+        };
+
+        afterEach(() => {
+            if (fileStore && fileStore.db && fileStore.db.open) {
+                fileStore.db.close();
+            }
+            fileStore = null;
+            if (tmpDir) {
+                fs.rmSync(tmpDir, { recursive: true, force: true });
+                tmpDir = null;
+            }
+        });
+
+        test('should skip, and say so once, when the database cannot reclaim space', async () => {
+            fileStore = makeFileStore();
+            await fileStore.init();
+            expect(fileStore.db.pragma('auto_vacuum', { simple: true })).not.toBe(2);
+
+            await fileStore.runVacuum();
+            expect(fileStore.warnedVacuumMode).toBe(true);
+            expect(fileStore.vacuumRunning).toBe(false);
+
+            // The notice is logged once, not on every retention cycle
+            const notices = l.info.mock.calls.filter(
+                (args) => typeof args[0] === 'string' && args[0].includes('auto_vacuum')
+            ).length;
+            await fileStore.runVacuum();
+            expect(l.info.mock.calls.filter(
+                (args) => typeof args[0] === 'string' && args[0].includes('auto_vacuum')
+            ).length).toBe(notices);
+        });
+
+        test('should skip a database held only in memory', async () => {
+            await store.runVacuum();
+            expect(store.vacuumRunning).toBe(false);
+            expect(store.warnedVacuumMode).toBeUndefined();
+        });
+
+        test('should not throw when the vacuum thread fails', async () => {
+            fileStore = makeFileStore();
+            await fileStore.init();
+
+            // Reach the thread whatever the state of the file
+            fileStore.db.pragma = (pragma, opts) => {
+                if (pragma === 'auto_vacuum') return 2;
+                if (pragma === 'freelist_count') return 1000000;
+                return [];
+            };
+            fileStore.databasePath = path.join(tmpDir, 'no', 'such', 'dir', 'messages.db');
+
+            await expect(fileStore.runVacuum()).resolves.toBeUndefined();
+            expect(fileStore.vacuumRunning).toBe(false);
+        });
+    });
 });
