@@ -171,24 +171,27 @@ module.exports = class Queue extends EventEmitter {
         await this._send(this.queueToSockets, Buffer.from(payload), {persistent});
     }
 
+    // Never rejects. Callers fire this from socket event handlers without awaiting, so a
+    // rejection here is an unhandledRejection, which Node treats as fatal.
     async _send(queue, buffer, options) {
-        if (!this.channel) {
-            await this.connect();
+        try {
+            if (!this.channel) {
+                await this.connect();
+            }
+            this.channel.sendToQueue(queue, buffer, options);
+            return;
+        } catch (err) {
+            // Broker gone, or the channel closed between the null check and the send
+            this.channel = null;
+            l.warn('AMQP sendToQueue failed, reconnecting and retrying:', err.message);
         }
 
         try {
-            this.channel.sendToQueue(queue, buffer, options);
-        } catch (err) {
-            // Channel closed between the null check and the send (race condition).
-            // Null it out and retry once after reconnecting.
-            this.channel = null;
-            l.warn('AMQP sendToQueue failed, reconnecting and retrying:', err.message);
             await this.connect();
-            try {
-                this.channel.sendToQueue(queue, buffer, options);
-            } catch (retryErr) {
-                l.error('AMQP sendToQueue failed after reconnect, dropping message:', retryErr.message);
-            }
+            this.channel.sendToQueue(queue, buffer, options);
+        } catch (retryErr) {
+            l.error('AMQP sendToQueue failed after reconnect, dropping message:', retryErr.message);
+            this.scheduleReconnect();
         }
     }
 
