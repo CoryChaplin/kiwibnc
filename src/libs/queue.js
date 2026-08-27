@@ -12,6 +12,8 @@ module.exports = class Queue extends EventEmitter {
         this.queueToSockets = conf.get('queue.sockets_queue', 'q_sockets');
         this.queueToWorker = conf.get('queue.worker_queue', 'q_worker');
         this.channel = null;
+        // The connection owning this.channel, kept so a reconnect can close it (see _closeConn)
+        this.conn = null;
         this.consumerTag = '';
         this.closing = false;
         this.reconnecting = false;
@@ -46,7 +48,31 @@ module.exports = class Queue extends EventEmitter {
         return this._connectPromise;
     }
 
+    // Closes the connection we're about to replace and waits for the broker to release its
+    // consumers. Never rejects - a connection being discarded has nothing useful to fail at.
+    _closeConn() {
+        let conn = this.conn;
+        this.conn = null;
+        this.channel = null;
+        if (!conn) {
+            return Promise.resolve();
+        }
+
+        return new Promise((resolve) => {
+            try {
+                conn.close(() => resolve());
+            } catch (err) {
+                resolve();
+            }
+        });
+    }
+
     async _doConnect() {
+        // A dead channel does not close its connection, and that connection still owns the
+        // exclusive consumer on our queue. Opening a new one without closing it first gets
+        // ACCESS_REFUSED, which closes the new channel and reconnects, forever.
+        await this._closeConn();
+
         let {conn, channel} = await this.getChannel();
         await channel.assertQueue(this.queueToSockets, {durable: true});
         await channel.assertQueue(this.queueToWorker, {durable: true});
@@ -78,6 +104,7 @@ module.exports = class Queue extends EventEmitter {
         channel.on('close', () => onLost('channel closed'));
 
         this.channel = channel;
+        this.conn = conn;
 
         // Re-arm consumption on the fresh channel. No-op for send-only
         // instances and when already bound, so every reconnect path
@@ -370,6 +397,9 @@ module.exports = class Queue extends EventEmitter {
                 this.stats.increment('connecting.time');
                 conn.createChannel((err, channel) => {
                     if (err) {
+                        // Nothing else references this connection, and leaving it open would
+                        // hold the exclusive consumer against the next attempt
+                        try { conn.close(); } catch (e) {}
                         reject(err);
                         return;
                     }
