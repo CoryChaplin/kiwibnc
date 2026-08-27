@@ -614,6 +614,10 @@ async function initWebserver(app) {
             // These errors are expected as clients always disconnect at random times before
             // waiting for a response, or general network issues
             return;
+        } else if (error.status >= 400 && error.status < 500) {
+            // A bad request the server already rejected, eg a scanner probing for path
+            // traversal. Logging a stack per attempt lets anyone flood the log at will
+            l.debug(`Webserver ${error.status} ${error.message}`);
         } else {
             l.error('Webserver error', error);
         }
