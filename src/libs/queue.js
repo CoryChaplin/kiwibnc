@@ -129,7 +129,15 @@ module.exports = class Queue extends EventEmitter {
         tryReconnect();
     }
 
-    safeAck(msg) {
+    safeAck(msg, channel) {
+        // A delivery tag only means anything on the channel that delivered it. Acking one
+        // on a fresh channel is answered with PRECONDITION_FAILED, which closes that
+        // channel and reconnects - and since every queued message from the old channel
+        // does it in turn, the reconnects loop. Skipping is safe: the broker redelivers.
+        if (channel && channel !== this.channel) {
+            l.debug('AMQP message from a replaced channel, it will be redelivered');
+            return;
+        }
         // The channel can be nulled out mid-processing by an unexpected close
         // (the await in processMsgQueue yields). Skipping the ack is safe: the
         // broker redelivers unacked messages once the consumer is re-armed.
@@ -239,7 +247,7 @@ module.exports = class Queue extends EventEmitter {
 
             messageTmr.stop();
             qMessage.ack();
-            this.safeAck(qMessage.item.amqpMsg);
+            this.safeAck(qMessage.item.amqpMsg, qMessage.item.amqpChannel);
 
             cnt++;
             if (now() - lastCnt > 5) {
@@ -260,7 +268,9 @@ module.exports = class Queue extends EventEmitter {
         // Stored so scheduleReconnect() can re-register the consumer on a fresh
         // channel after a drop. Reuses the same queue/pipeline state above.
         this._startConsuming = () => {
-            this.channel.consume(queueName, (msg) => {
+            // Captured so each message is acked on the channel it arrived on, see safeAck()
+            let channel = this.channel;
+            channel.consume(queueName, (msg) => {
                 if (this.closing) {
                     return;
                 }
@@ -281,7 +291,7 @@ module.exports = class Queue extends EventEmitter {
                 // Messages are expected to be an array of 2 items: [event_name, obj_of_params]
                 if (!obj || obj.length !== 2) {
                     this.stats.increment('message.ignored');
-                    this.safeAck(msg);
+                    this.safeAck(msg, channel);
                     return;
                 }
 
@@ -292,14 +302,14 @@ module.exports = class Queue extends EventEmitter {
                     if (obj[1] && obj[1].id) {
                         // This event is related to a connection ID
                         let conId = obj[1].id;
-                        q.add('connection', conId, {amqpMsg: msg, event: obj});
+                        q.add('connection', conId, {amqpMsg: msg, amqpChannel: channel, event: obj});
                     } else {
                         // An internal bnc event
-                        q.add('bnc', 'internal', {amqpMsg: msg, event: obj});
+                        q.add('bnc', 'internal', {amqpMsg: msg, amqpChannel: channel, event: obj});
                     }
 
                 } else {
-                    this.safeAck(msg);
+                    this.safeAck(msg, channel);
                 }
 
                 process.nextTick(() => {
