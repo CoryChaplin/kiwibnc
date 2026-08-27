@@ -20,6 +20,11 @@ class SqliteMessageStore {
         this.db = new sqlite3(this.databasePath);
         this.retentionDaysChannels = loggingConf.retention_days_channels || 0;
         this.retentionDaysPMs = loggingConf.retention_days_pms || 0;
+        // The server tab is high volume server output, not conversation, so it follows the
+        // channel retention rather than the (usually longer) PM one
+        this.retentionDaysServer = loggingConf.retention_days_server !== undefined
+            ? parseInt(loggingConf.retention_days_server, 10)
+            : this.retentionDaysChannels;
         this.retentionCleanupInterval = loggingConf.retention_cleanup_interval || 1440; // Default 24h
         // Minutes to wait before the first cleanup pass. Running it at boot means taking the
         // sqlite write lock exactly when every client is reconnecting and asking for history.
@@ -165,10 +170,22 @@ class SqliteMessageStore {
                         }
                     };
 
-                    const processRetention = async (days, isChannel) => {
+                    const processRetention = async (days, kind) => {
                         if (days <= 0) return;
                         let more = true;
                         let busyRetries = 0;
+                        const isChannel = kind === 'channels';
+
+                        // The server tab is matched on prefixref, which is indexed, so it needs
+                        // none of the temp table machinery below
+                        let emptyPrefixId = null;
+                        if (kind === 'server') {
+                            let row = this.db.prepare("SELECT id FROM data WHERE data = ''").get();
+                            if (!row) {
+                                return;
+                            }
+                            emptyPrefixId = row.id;
+                        }
 
                         // Pre-compute the set of matching buffer IDs ONCE into a temp table.
                         //
@@ -178,13 +195,17 @@ class SqliteMessageStore {
                         // (LIKE index optimisation only applies to TEXT affinity columns). On a
                         // large database the scan takes several seconds and blocks the event loop
                         // for the entire duration, stalling HTTP requests and IRC keepalives.
-                        const tempBufs = isChannel ? 'tmp_ret_ch_bufs' : 'tmp_ret_pm_bufs';
-                        this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
-                        const bufSql = isChannel
-                            ? `CREATE TEMP TABLE ${tempBufs} AS SELECT id FROM data WHERE CAST(data AS TEXT) LIKE '#%' OR CAST(data AS TEXT) LIKE '&%'`
-                            : `CREATE TEMP TABLE ${tempBufs} AS SELECT id FROM data WHERE CAST(data AS TEXT) NOT LIKE '#%' AND CAST(data AS TEXT) NOT LIKE '&%'`;
-                        this.db.exec(bufSql);
-                        this.db.exec(`CREATE INDEX idx_${tempBufs} ON ${tempBufs}(id)`);
+                        const tempBufs = kind === 'server'
+                            ? null
+                            : (isChannel ? 'tmp_ret_ch_bufs' : 'tmp_ret_pm_bufs');
+                        if (tempBufs) {
+                            this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
+                            const bufSql = isChannel
+                                ? `CREATE TEMP TABLE ${tempBufs} AS SELECT id FROM data WHERE CAST(data AS TEXT) LIKE '#%' OR CAST(data AS TEXT) LIKE '&%'`
+                                : `CREATE TEMP TABLE ${tempBufs} AS SELECT id FROM data WHERE CAST(data AS TEXT) NOT LIKE '#%' AND CAST(data AS TEXT) NOT LIKE '&%'`;
+                            this.db.exec(bufSql);
+                            this.db.exec(`CREATE INDEX idx_${tempBufs} ON ${tempBufs}(id)`);
+                        }
 
                         while (more) {
                             // If a transaction is currently open (e.g. from storeMessageLoop), wait
@@ -192,7 +213,7 @@ class SqliteMessageStore {
                             if (this.db.inTransaction) {
                                 if (busyRetries++ > 50) { // Wait max 5 seconds
                                     l.warn('Database busy with other transactions, aborting retention cleanup');
-                                    this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
+                                    if (tempBufs) this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
                                     return;
                                 }
                                 await new Promise(resolve => setTimeout(resolve, 100));
@@ -206,7 +227,7 @@ class SqliteMessageStore {
                             while (true) {
                                 try {
                                     this.db.transaction(() => {
-                                        rows = this.runRetentionCleanup(days, isChannel, BATCH_SIZE, tempBufs);
+                                        rows = this.runRetentionCleanup(days, kind, BATCH_SIZE, tempBufs, emptyPrefixId);
                                     })();
                                     break;
                                 } catch (err) {
@@ -240,14 +261,18 @@ class SqliteMessageStore {
                             }
                         }
 
-                        this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
+                        if (tempBufs) this.db.exec(`DROP TABLE IF EXISTS ${tempBufs}`);
                     };
 
                     if (this.retentionDaysChannels > 0) {
-                        await processRetention(this.retentionDaysChannels, true);
+                        await processRetention(this.retentionDaysChannels, 'channels');
+                    }
+                    // Before the PM pass, so the PM temp table has less to walk
+                    if (this.retentionDaysServer > 0) {
+                        await processRetention(this.retentionDaysServer, 'server');
                     }
                     if (this.retentionDaysPMs > 0) {
-                        await processRetention(this.retentionDaysPMs, false);
+                        await processRetention(this.retentionDaysPMs, 'pms');
                     }
 
                     // Anything left over from the last partial chunk
@@ -448,15 +473,30 @@ class SqliteMessageStore {
      * @param {number} limit - Max number of rows to delete per batch
      * @returns {Array} Deleted rows with their references
      */
-    runRetentionCleanup(days, isChannel, limit, bufTableName) {
+    runRetentionCleanup(days, kind, limit, bufTableName, emptyPrefixId) {
         if (days <= 0) return [];
 
+        const isChannel = kind === 'channels';
         let cutoffDate = new Date();
         cutoffDate.setDate(cutoffDate.getDate() - days);
         let cutoffTime = cutoffDate.getTime();
 
         let sql;
-        if (bufTableName) {
+        let params = [cutoffTime, limit || 1000];
+        if (kind === 'server') {
+            // A message with no sender is server output, never a conversation. Matching on
+            // prefixref uses logs_prefixref, so this needs no temp table of buffer ids.
+            sql = `
+                DELETE FROM logs
+                WHERE rowid IN (
+                    SELECT rowid FROM logs
+                    WHERE prefixref = ? AND time < ?
+                    LIMIT ?
+                )
+                RETURNING bufferref, msgtagsref, dataref, prefixref, paramsref
+            `;
+            params = [emptyPrefixId, cutoffTime, limit || 1000];
+        } else if (bufTableName) {
             // Use the pre-computed temp table of buffer IDs (avoids repeated full table
             // scan of the data column which has BLOB affinity and cannot use LIKE index).
             sql = `
@@ -499,8 +539,9 @@ class SqliteMessageStore {
             `;
         }
 
-        let rows = this.db.prepare(sql).all(cutoffTime, limit || 1000);
-        l.info(`Retention cleanup (${isChannel ? 'channels' : 'PMs'}, >${days} days) removed ${rows.length} messages`);
+        let label = kind === 'channels' ? 'channels' : kind === 'server' ? 'server tab' : 'PMs';
+        let rows = this.db.prepare(sql).all(...params);
+        l.info(`Retention cleanup (${label}, >${days} days) removed ${rows.length} messages`);
         return rows;
     }
 
