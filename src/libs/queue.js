@@ -59,10 +59,22 @@ module.exports = class Queue extends EventEmitter {
         }
 
         return new Promise((resolve) => {
-            try {
-                conn.close(() => resolve());
-            } catch (err) {
+            let done = false;
+            let finish = () => {
+                if (done) {
+                    return;
+                }
+                done = true;
                 resolve();
+            };
+
+            // An already dead connection may never call back, and connect() shares one promise
+            // between all its callers, so hanging here would block every later attempt
+            setTimeout(finish, 2000).unref();
+            try {
+                conn.close(finish);
+            } catch (err) {
+                finish();
             }
         });
     }
