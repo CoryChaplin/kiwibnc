@@ -299,3 +299,46 @@ describe('getOrAddBuffer', () => {
         expect(markDirtySpy).not.toHaveBeenCalled();
     });
 });
+
+describe('buffers persistence for a connection with no saved row', () => {
+    let ConnectionState;
+
+    beforeEach(() => {
+        global.l = { debug: jest.fn(), info: jest.fn() };
+        delete require.cache[require.resolve('../../src/worker/connectionstate')];
+        ConnectionState = require('../../src/worker/connectionstate').ConnectionState;
+    });
+
+    afterEach(() => {
+        delete global.l;
+    });
+
+    it('should keep buffers across a save and reload', async () => {
+        let saved;
+        const query = () => ({
+            where() { return this; },
+            first: async () => saved,
+            insert(row) {
+                saved = row;
+                return { toString: () => 'insert into connections' };
+            },
+        });
+        query.raw = jest.fn().mockResolvedValue(undefined);
+        const db = { dbConnections: query };
+
+        // A brand new upstream has no row yet when its state is first loaded
+        const state = new ConnectionState('con1', db);
+        await state.maybeLoad();
+        const buffer = state.addBuffer('#chan');
+        buffer.joined = true;
+        buffer.shouldBeJoined = true;
+        await state.save();
+
+        const reloaded = new ConnectionState('con1', db);
+        await reloaded.maybeLoad();
+
+        expect(reloaded.getBuffer('#chan')).toBeDefined();
+        expect(reloaded.getBuffer('#chan').joined).toBe(true);
+        expect(reloaded.getBuffer('#chan').shouldBeJoined).toBe(true);
+    });
+});
