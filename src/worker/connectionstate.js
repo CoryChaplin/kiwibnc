@@ -328,7 +328,8 @@ class ConnectionState {
             this.registrationLines = [];
             this.isupports = [];
             this.caps = new Set();
-            this.buffers = [];
+            // Must be a plain object: buffers are keyed by name and an array would save as "[]"
+            this.buffers = Object.create(null);
             this.tempData = {};
             this.logging = true;
         } else {
